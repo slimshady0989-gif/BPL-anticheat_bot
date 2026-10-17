@@ -235,10 +235,12 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                     Path(destination).write_bytes(b"partial video")
 
                 message = SimpleNamespace(
-                    author=object(),
-                    channel=SimpleNamespace(id=700),
+                    author=SimpleNamespace(mention="@player", id=123),
+                    channel=SimpleNamespace(id=700, send=AsyncMock()),
                     id=1001,
                     guild=SimpleNamespace(id=71),
+                    delete=AsyncMock(),
+                    attachments=[],
                 )
                 app.KANAL_ANTYCHEAT_MAGAZYN[71] = 700
                 with (
@@ -260,10 +262,12 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
         await semaphore.acquire()
         await semaphore.acquire()
         message = SimpleNamespace(
-            author=object(),
-            channel=SimpleNamespace(id=701),
+            author=SimpleNamespace(mention="@player", id=123),
+            channel=SimpleNamespace(id=701, send=AsyncMock()),
             id=1002,
             guild=SimpleNamespace(id=72),
+            delete=AsyncMock(),
+            attachments=[],
         )
         app.KANAL_ANTYCHEAT_MAGAZYN[72] = 701
         try:
@@ -277,10 +281,103 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
 
             mkstemp.assert_not_called()
             download.assert_not_awaited()
+            message.delete.assert_not_awaited()
+            message.channel.send.assert_not_awaited()
         finally:
             semaphore.release()
             semaphore.release()
             app.KANAL_ANTYCHEAT_MAGAZYN.pop(72, None)
+
+    async def test_clean_and_anomalous_clips_both_dispatch_complete_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(app.tempfile, "tempdir", directory):
+                for anomalous in (False, True):
+                    with self.subTest(anomalous=anomalous):
+                        guild_id = 73
+                        archive_id = 702
+                        alert_id = 890
+                        app.KANAL_ANTYCHEAT_MAGAZYN[guild_id] = archive_id
+                        app.KANAL_ANTYCHEAT_ALERTY[guild_id] = alert_id
+
+                        report_channel = SimpleNamespace(send=AsyncMock())
+                        message = SimpleNamespace(
+                            author=SimpleNamespace(mention="@player", id=123),
+                            channel=SimpleNamespace(id=archive_id, send=AsyncMock()),
+                            content="https://example.test/clips/clip%20one.mp4",
+                            attachments=[],
+                            id=1003,
+                            guild=SimpleNamespace(id=guild_id),
+                            delete=AsyncMock(),
+                        )
+                        result = {
+                            "alert": anomalous,
+                            "raport": "• Sekunda 1.00s (Wskaźnik pędu: 30.00)"
+                            if anomalous
+                            else "Brak krytycznych odchyleń.",
+                        }
+                        with (
+                            patch.object(
+                                app,
+                                "download_video",
+                                new_callable=AsyncMock,
+                            ),
+                            patch.object(
+                                app,
+                                "analyze_video_async",
+                                new_callable=AsyncMock,
+                                return_value=result,
+                            ),
+                            patch.object(
+                                app.bot,
+                                "get_channel",
+                                return_value=report_channel,
+                            ),
+                        ):
+                            await app.on_message(message)
+
+                        message.delete.assert_awaited_once()
+                        message.channel.send.assert_awaited_once()
+                        self.assertEqual(
+                            message.channel.send.await_args.kwargs["delete_after"],
+                            15,
+                        )
+                        report_channel.send.assert_awaited_once()
+                        embed = report_channel.send.await_args.kwargs["embed"]
+                        self.assertIn("clip one.mp4", embed.description)
+                        self.assertIn("@player (ID: 123)", embed.description)
+                        self.assertIn(
+                            "[Otwórz wideo](https://example.test/clips/clip%20one.mp4)",
+                            embed.description,
+                        )
+                        self.assertIn(
+                            f"```markdown\n{result['raport']}\n```",
+                            embed.description,
+                        )
+                        self.assertIsInstance(
+                            report_channel.send.await_args.kwargs["view"],
+                            app.PersistentAdminView,
+                        )
+                        self.assertEqual(
+                            embed.title,
+                            "⚠️ WYKRYTO POTENCJALNĄ ANOMALIĘ RUCHU"
+                            if anomalous
+                            else "✅ MATERIAŁ ZWERYFIKOWANY - RUCH W NORMIE",
+                        )
+                        self.assertIn(
+                            "🔴 WYKRYTO ODCHYLENIA OD NORMY"
+                            if anomalous
+                            else "🟢 CZYSTO (Brak podejrzanych zachowań)",
+                            embed.description,
+                        )
+                        self.assertEqual(
+                            embed.color.value,
+                            discord.Color.orange().value
+                            if anomalous
+                            else discord.Color.green().value,
+                        )
+
+        app.KANAL_ANTYCHEAT_MAGAZYN.pop(73, None)
+        app.KANAL_ANTYCHEAT_ALERTY.pop(73, None)
 
 
 class AdminViewTests(unittest.IsolatedAsyncioTestCase):
@@ -339,8 +436,63 @@ class AdminViewTests(unittest.IsolatedAsyncioTestCase):
         archive_channel.fetch_message.assert_awaited_once_with(5678)
         source_message.delete.assert_awaited_once()
         response.edit_message.assert_awaited_once()
+        self.assertEqual(
+            response.edit_message.await_args.kwargs["embed"].title,
+            "✅ MATERIAŁ ZWERYFIKOWANY I ZARCHIWIZOWANY",
+        )
         app.KANAL_ANTYCHEAT_MAGAZYN.pop(55, None)
         app.KANAL_ANTYCHEAT_ALERTY.pop(55, None)
+
+    async def test_callback_archives_alert_when_source_message_id_is_missing(self):
+        app.KANAL_ANTYCHEAT_ALERTY[56] = 889
+        embed = discord.Embed(title="Pending review")
+        response = SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock())
+        interaction = SimpleNamespace(
+            guild_id=56,
+            channel_id=889,
+            guild=object(),
+            user=SimpleNamespace(guild_permissions=SimpleNamespace(administrator=True)),
+            response=response,
+            message=SimpleNamespace(embeds=[embed]),
+        )
+        view = app.PersistentAdminView()
+        with patch.object(app.bot, "get_channel") as get_channel:
+            await view.children[0].callback(interaction)
+
+        get_channel.assert_not_called()
+        response.edit_message.assert_awaited_once_with(embed=embed, view=None)
+        self.assertEqual(embed.title, "✅ MATERIAŁ ZWERYFIKOWANY I ZARCHIWIZOWANY")
+        app.KANAL_ANTYCHEAT_ALERTY.pop(56, None)
+
+    async def test_callback_archives_alert_when_source_message_is_already_deleted(self):
+        app.KANAL_ANTYCHEAT_MAGAZYN[57] = 778
+        app.KANAL_ANTYCHEAT_ALERTY[57] = 890
+        archive_channel = SimpleNamespace(
+            fetch_message=AsyncMock(
+                side_effect=discord.NotFound(
+                    SimpleNamespace(status=404, reason="Not Found"),
+                    "Unknown Message",
+                )
+            )
+        )
+        embed = discord_embed_with_source_id(5679)
+        response = SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock())
+        interaction = SimpleNamespace(
+            guild_id=57,
+            channel_id=890,
+            guild=object(),
+            user=SimpleNamespace(guild_permissions=SimpleNamespace(administrator=True)),
+            response=response,
+            message=SimpleNamespace(embeds=[embed]),
+        )
+        with patch.object(app.bot, "get_channel", return_value=archive_channel):
+            await app.PersistentAdminView().children[0].callback(interaction)
+
+        archive_channel.fetch_message.assert_awaited_once_with(5679)
+        response.edit_message.assert_awaited_once_with(embed=embed, view=None)
+        self.assertEqual(embed.title, "✅ MATERIAŁ ZWERYFIKOWANY I ZARCHIWIZOWANY")
+        app.KANAL_ANTYCHEAT_MAGAZYN.pop(57, None)
+        app.KANAL_ANTYCHEAT_ALERTY.pop(57, None)
 
 
 class DynamicChannelSetupTests(unittest.IsolatedAsyncioTestCase):
@@ -371,6 +523,7 @@ class DynamicChannelSetupTests(unittest.IsolatedAsyncioTestCase):
         archive, alerts = guild.created_channels
         self.assertIs(archive.overwrites[guild.default_role].view_channel, True)
         self.assertIs(archive.overwrites[guild.default_role].send_messages, True)
+        self.assertIs(archive.overwrites[guild.default_role].read_message_history, False)
         self.assertIs(alerts.overwrites[guild.default_role].view_channel, False)
         self.assertIs(alerts.overwrites[guild.default_role].read_message_history, False)
         self.assertIs(alerts.overwrites[bot_member].view_channel, True)
@@ -408,7 +561,7 @@ class DynamicChannelSetupTests(unittest.IsolatedAsyncioTestCase):
         everyone = guild.default_role
         archive_overwrites = {
             everyone: discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True
+                view_channel=True, send_messages=True, read_message_history=False
             ),
             bot_member: discord.PermissionOverwrite(
                 view_channel=True,
