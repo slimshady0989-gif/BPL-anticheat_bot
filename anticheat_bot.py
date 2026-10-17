@@ -5,7 +5,7 @@ import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import cv2
@@ -193,7 +193,7 @@ async def setup_server_channels(guild):
         archive_overwrites[everyone] = discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
-            read_message_history=True,
+            read_message_history=False,
         )
         archive_overwrites[bot_member] = discord.PermissionOverwrite(
             view_channel=True,
@@ -302,37 +302,25 @@ class PersistentAdminView(discord.ui.View):
             return
 
         source_id = self.magazyn_msg_id or _source_message_id(interaction)
-        if source_id is None:
-            await interaction.response.send_message(
-                "⚠️ Brak prawidłowego odwołania do wiadomości z materiałem.",
-                ephemeral=True,
-            )
-            return
-
-        archive_channel_id = KANAL_ANTYCHEAT_MAGAZYN.get(interaction.guild_id)
-        magazyn_channel = bot.get_channel(archive_channel_id) if archive_channel_id else None
-        if magazyn_channel is None:
-            await interaction.response.send_message(
-                "⚠️ Nie znaleziono kanału magazynu; materiał nie został usunięty.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            source_message = await magazyn_channel.fetch_message(source_id)
-            await source_message.delete()
-        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-            LOGGER.exception("Could not delete source message %s", source_id)
-            await interaction.response.send_message(
-                "⚠️ Nie udało się usunąć materiału z magazynu.",
-                ephemeral=True,
-            )
-            return
+        if source_id is not None:
+            archive_channel_id = KANAL_ANTYCHEAT_MAGAZYN.get(interaction.guild_id)
+            magazyn_channel = bot.get_channel(archive_channel_id) if archive_channel_id else None
+            if magazyn_channel is not None:
+                try:
+                    source_message = await magazyn_channel.fetch_message(source_id)
+                    await source_message.delete()
+                except discord.NotFound:
+                    LOGGER.info("Source message %s was already removed", source_id)
+                except discord.HTTPException:
+                    LOGGER.exception("Could not delete source message %s", source_id)
 
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.green()
-        embed.title = "✅ MATERIAŁ ZWERYFIKOWANY I USUNIĘTY"
-        await interaction.response.edit_message(embed=embed, view=None)
+        embed.title = "✅ MATERIAŁ ZWERYFIKOWANY I ZARCHIWIZOWANY"
+        try:
+            await interaction.response.edit_message(embed=embed, view=None)
+        except discord.HTTPException:
+            LOGGER.exception("Could not update anti-cheat alert after staff review")
 
 
 _persistent_view_registered = False
@@ -366,6 +354,13 @@ def _video_url_from_message(message):
     return None
 
 
+def _filename_from_message(message, video_url):
+    if message.attachments:
+        return message.attachments[0].filename
+    filename = unquote(urlparse(video_url).path.rsplit("/", 1)[-1])
+    return filename or "video"
+
+
 @bot.event
 async def on_message(message):
     archive_channel_id = KANAL_ANTYCHEAT_MAGAZYN.get(message.guild.id) if message.guild else None
@@ -379,6 +374,22 @@ async def on_message(message):
         LOGGER.warning("Rejecting video message %s: processing capacity is full", message.id)
         return
 
+    filename = _filename_from_message(message, video_url)
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        LOGGER.exception("Could not immediately remove submitted video message %s", message.id)
+
+    try:
+        await message.channel.send(
+            f"💚 Dziękujemy za zgłoszenie, {message.author.mention}! "
+            f"Twój plik {filename} trafił do bezpiecznego magazynu. "
+            "Sędziowie właśnie rozpoczęli analizę.",
+            delete_after=15,
+        )
+    except discord.HTTPException:
+        LOGGER.exception("Could not send submission confirmation for message %s", message.id)
+
     async with processing_semaphore:
         fd, temp_path = tempfile.mkstemp(prefix="verify_", suffix=".mp4")
         os.close(fd)
@@ -388,16 +399,29 @@ async def on_message(message):
             alert_channel_id = KANAL_ANTYCHEAT_ALERTY.get(message.guild.id)
             alerty_channel = bot.get_channel(alert_channel_id) if alert_channel_id else None
 
-            if wynik["alert"] and alerty_channel:
+            if alerty_channel:
+                anomalous = wynik["alert"]
                 embed = discord.Embed(
-                    title="⚠️ WYKRYTO POTENCJALNĄ ANOMALIĘ RUCHU",
-                    color=discord.Color.orange(),
+                    title=(
+                        "⚠️ WYKRYTO POTENCJALNĄ ANOMALIĘ RUCHU"
+                        if anomalous
+                        else "✅ MATERIAŁ ZWERYFIKOWANY - RUCH W NORMIE"
+                    ),
+                    color=(
+                        discord.Color.orange()
+                        if anomalous
+                        else discord.Color.green()
+                    ),
                 )
                 embed.description = (
                     "**Materiały do ręcznej weryfikacji przez sędziego:**\n"
-                    f"Oryginalny klip: [Otwórz wideo]({video_url})\n\n"
+                    f"**Plik:** {filename}\n"
+                    f"**Gracz:** {message.author.mention} (ID: {message.author.id})\n"
+                    f"**Wideo:** [Otwórz wideo]({video_url})\n\n"
+                    f"**Status:** "
+                    f"{'🔴 WYKRYTO ODCHYLENIA OD NORMY' if anomalous else '🟢 CZYSTO (Brak podejrzanych zachowań)'}\n\n"
                     "**Logi analizatora wizyjnego (Optical Flow peaks):**\n"
-                    f"{wynik['raport']}\n\n"
+                    f"```markdown\n{wynik['raport']}\n```\n\n"
                     "*To sygnał do ręcznej weryfikacji, nie werdykt ani dowód oszustwa.*"
                 )
                 embed.add_field(
@@ -406,7 +430,16 @@ async def on_message(message):
                     inline=False,
                 )
                 embed.set_footer(text="System asysty sędziowskiej BPL")
-                await alerty_channel.send(embed=embed, view=PersistentAdminView())
+                try:
+                    await alerty_channel.send(embed=embed, view=PersistentAdminView())
+                except discord.HTTPException:
+                    LOGGER.exception("Could not dispatch report for video message %s", message.id)
+            else:
+                LOGGER.error(
+                    "Cannot dispatch report for video message %s: alert channel %s unavailable",
+                    message.id,
+                    alert_channel_id,
+                )
         except FileTooLargeError:
             LOGGER.warning("Rejected oversized video from message %s", message.id)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
