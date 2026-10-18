@@ -189,19 +189,6 @@ async def setup_server_channels(guild):
             return False
 
         everyone = guild.default_role
-        archive_overwrites = dict(category.overwrites)
-        archive_overwrites[everyone] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=False,
-        )
-        archive_overwrites[bot_member] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_messages=True,
-            attach_files=True,
-        )
 
         archive_channel = next(
             (
@@ -215,25 +202,38 @@ async def setup_server_channels(guild):
             archive_channel = await guild.create_text_channel(
                 ANTICHEAT_ARCHIVE_CHANNEL,
                 category=category,
-                overwrites=archive_overwrites,
             )
             LOGGER.info("Created #%s in guild %s", ANTICHEAT_ARCHIVE_CHANNEL, guild.id)
-        elif dict(archive_channel.overwrites) != archive_overwrites:
-            await archive_channel.edit(overwrites=archive_overwrites)
-            LOGGER.info("Updated permissions for #%s in guild %s", ANTICHEAT_ARCHIVE_CHANNEL, guild.id)
 
-        alert_overwrites = dict(category.overwrites)
-        alert_overwrites[everyone] = discord.PermissionOverwrite(
-            view_channel=False,
-            read_message_history=False,
+        archive_permissions = (
+            (
+                everyone,
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=False,
+                ),
+            ),
+            (
+                bot_member,
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True,
+                    attach_files=True,
+                ),
+            ),
         )
-        alert_overwrites[bot_member] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_messages=True,
-            attach_files=True,
-        )
+        for target, overwrite in archive_permissions:
+            if archive_channel.overwrites_for(target) != overwrite:
+                await archive_channel.set_permissions(target, overwrite=overwrite)
+                LOGGER.info(
+                    "Updated permissions for #%s in guild %s",
+                    ANTICHEAT_ARCHIVE_CHANNEL,
+                    guild.id,
+                )
+
         alert_channel = next(
             (
                 channel
@@ -246,12 +246,36 @@ async def setup_server_channels(guild):
             alert_channel = await guild.create_text_channel(
                 ANTICHEAT_ALERT_CHANNEL,
                 category=category,
-                overwrites=alert_overwrites,
             )
             LOGGER.info("Created restricted #%s in guild %s", ANTICHEAT_ALERT_CHANNEL, guild.id)
-        elif dict(alert_channel.overwrites) != alert_overwrites:
-            await alert_channel.edit(overwrites=alert_overwrites)
-            LOGGER.info("Updated permissions for restricted #%s in guild %s", ANTICHEAT_ALERT_CHANNEL, guild.id)
+
+        alert_permissions = (
+            (
+                everyone,
+                discord.PermissionOverwrite(
+                    view_channel=False,
+                    read_message_history=False,
+                ),
+            ),
+            (
+                bot_member,
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True,
+                    attach_files=True,
+                ),
+            ),
+        )
+        for target, overwrite in alert_permissions:
+            if alert_channel.overwrites_for(target) != overwrite:
+                await alert_channel.set_permissions(target, overwrite=overwrite)
+                LOGGER.info(
+                    "Updated permissions for restricted #%s in guild %s",
+                    ANTICHEAT_ALERT_CHANNEL,
+                    guild.id,
+                )
 
         KANAL_ANTYCHEAT_MAGAZYN[guild.id] = archive_channel.id
         KANAL_ANTYCHEAT_ALERTY[guild.id] = alert_channel.id
