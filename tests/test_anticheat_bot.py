@@ -445,19 +445,20 @@ class AnalyzerTests(unittest.TestCase):
 class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
     async def test_semaphore_reserves_capacity_before_discord_awaits(self):
         semaphore = asyncio.Semaphore(2)
-        entered_deletes = 0
+        entered_downloads = 0
         both_entered = asyncio.Event()
-        release_deletes = asyncio.Event()
+        release_downloads = asyncio.Event()
         guild_id = 74
         archive_id = 703
         app.KANAL_ANTYCHEAT_MAGAZYN[guild_id] = archive_id
 
-        async def wait_for_release():
-            nonlocal entered_deletes
-            entered_deletes += 1
-            if entered_deletes == 2:
+        async def wait_for_download_release(url, destination):
+            nonlocal entered_downloads
+            entered_downloads += 1
+            if entered_downloads == 2:
                 both_entered.set()
-            await release_deletes.wait()
+            await release_downloads.wait()
+            Path(destination).write_bytes(b'video')
 
         messages = []
         for message_id in (1101, 1102, 1103):
@@ -469,7 +470,7 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                     attachments=[],
                     id=message_id,
                     guild=SimpleNamespace(id=guild_id),
-                    delete=AsyncMock(side_effect=wait_for_release),
+                    delete=AsyncMock(),
                 )
             )
 
@@ -478,6 +479,21 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(app, "processing_semaphore", semaphore),
                 patch.object(app, "database_pool", FakeDatabasePool()),
+                patch.object(app, "download_video", side_effect=wait_for_download_release),
+                patch.object(
+                    app,
+                    "analyze_video_async",
+                    new_callable=AsyncMock,
+                    return_value={
+                        "alert": False,
+                        "raport": "Brak krytycznych odchyleń.",
+                        "avg_speed": 10.0,
+                        "overall_avg_speed": 10.0,
+                        "magnitude_variance": 0.0,
+                        "jitter_frequency": 0.0,
+                        "control_type": "KBM",
+                    },
+                ),
             ):
                 tasks = [
                     asyncio.create_task(app.on_message(message))
@@ -486,15 +502,13 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(both_entered.wait(), timeout=1)
                 await tasks[2]
 
-                messages[0].delete.assert_awaited_once()
-                messages[1].delete.assert_awaited_once()
+                self.assertEqual(entered_downloads, 2)
+                messages[0].delete.assert_not_awaited()
+                messages[1].delete.assert_not_awaited()
                 messages[2].delete.assert_not_awaited()
         finally:
-            release_deletes.set()
-            for task in tasks[:2]:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks[:2], return_exceptions=True)
+            release_downloads.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
             app.KANAL_ANTYCHEAT_MAGAZYN.pop(guild_id, None)
 
     async def test_executor_analysis_does_not_block_event_loop(self):

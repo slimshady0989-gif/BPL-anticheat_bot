@@ -918,6 +918,18 @@ async def _recover_pending_report_alerts():
             LOGGER.exception("Could not recover alert for pending report %s", row["id"])
 
 
+async def _send_submission_notice(message, content, delete_after=15):
+    try:
+        await message.channel.send(content, delete_after=delete_after)
+    except discord.HTTPException:
+        LOGGER.exception(
+            "Could not send submission status for source message %s",
+            message.id,
+        )
+        return False
+    return True
+
+
 @bot.event
 async def on_message(message):
     archive_channel_id = (
@@ -941,30 +953,11 @@ async def on_message(message):
 
     await processing_semaphore.acquire()
     temp_path = None
+    report_persisted = False
+    needs_dispatch = False
     try:
         async with _lock_source_message(message.id):
             filename = _filename_from_message(message, video_url)
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                LOGGER.exception(
-                    "Could not immediately remove submitted video message %s",
-                    message.id,
-                )
-
-            try:
-                await message.channel.send(
-                    f"💚 Dziękujemy za zgłoszenie, {message.author.mention}! "
-                    f"Twój plik {filename} trafił do bezpiecznego magazynu. "
-                    "Sędziowie właśnie rozpoczęli analizę.",
-                    delete_after=15,
-                )
-            except discord.HTTPException:
-                LOGGER.exception(
-                    "Could not send submission confirmation for message %s",
-                    message.id,
-                )
-
             async with database_pool.acquire() as connection:
                 existing = await connection.fetchrow(
                     """
@@ -975,85 +968,127 @@ async def on_message(message):
                     message.id,
                 )
             if existing is not None:
-                if existing["report_status"] == "PENDING" and existing["message_id"] is None:
-                    alert_channel_id = KANAL_ANTYCHEAT_ALERTY.get(message.guild.id)
-                    alert_channel = (
-                        bot.get_channel(alert_channel_id) if alert_channel_id else None
-                    )
-                    if alert_channel is None:
-                        LOGGER.error(
-                            "Cannot dispatch existing report %s: alert channel unavailable",
-                            existing["id"],
-                        )
-                        return
-                    await _dispatch_report(existing["id"], alert_channel)
-                return
-
-            profiles = await _load_control_profiles(database_pool)
-            fd, temp_path = tempfile.mkstemp(prefix="verify_", suffix=".mp4")
-            os.close(fd)
-            await download_video(video_url, temp_path)
-            result = await analyze_video_async(
-                SafeBallisticAnalyzer(), temp_path, profiles
-            )
-            if result.get("powod"):
-                raise RuntimeError(result["powod"])
-
-            async with database_pool.acquire() as connection:
-                report_id = await connection.fetchval(
-                    """
-                    INSERT INTO reports (
-                        source_message_id, guild_id, player_id, player_name, video_url,
-                        control_type, avg_speed, magnitude_variance, jitter_frequency,
-                        is_anomalous, report_status, raw_report_text
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'PENDING', $11)
-                    ON CONFLICT (source_message_id) DO NOTHING
-                    RETURNING id
-                    """,
-                    message.id,
-                    message.guild.id,
-                    message.author.id,
-                    str(message.author),
-                    video_url,
-                    result["control_type"],
-                    result["avg_speed"],
-                    result["magnitude_variance"],
-                    result["jitter_frequency"],
-                    result["alert"],
-                    (
-                        f"{result['raport']}\n"
-                        f"Średnia prędkość globalna kadru: "
-                        f"{result.get('overall_avg_speed', 0.0):.2f}."
-                    ),
+                report_id = existing["id"]
+                report_persisted = True
+                needs_dispatch = (
+                    existing["report_status"] == "PENDING"
+                    and existing["message_id"] is None
                 )
-                if report_id is None:
+            else:
+                profiles = await _load_control_profiles(database_pool)
+                fd, temp_path = tempfile.mkstemp(prefix="verify_", suffix=".mp4")
+                os.close(fd)
+                await download_video(video_url, temp_path)
+                result = await analyze_video_async(
+                    SafeBallisticAnalyzer(), temp_path, profiles
+                )
+                if result.get("powod"):
+                    raise RuntimeError(result["powod"])
+
+                async with database_pool.acquire() as connection:
                     report_id = await connection.fetchval(
-                        "SELECT id FROM reports WHERE source_message_id = $1",
+                        """
+                        INSERT INTO reports (
+                            source_message_id, guild_id, player_id, player_name, video_url,
+                            control_type, avg_speed, magnitude_variance, jitter_frequency,
+                            is_anomalous, report_status, raw_report_text
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'PENDING', $11)
+                        ON CONFLICT (source_message_id) DO NOTHING
+                        RETURNING id
+                        """,
                         message.id,
+                        message.guild.id,
+                        message.author.id,
+                        str(message.author),
+                        video_url,
+                        result["control_type"],
+                        result["avg_speed"],
+                        result["magnitude_variance"],
+                        result["jitter_frequency"],
+                        result["alert"],
+                        (
+                            f"{result['raport']}\n"
+                            f"Średnia prędkość globalna kadru: "
+                            f"{result.get('overall_avg_speed', 0.0):.2f}."
+                        ),
                     )
-            if report_id is None:
-                raise RuntimeError(
-                    f"Could not persist or retrieve report for source message {message.id}."
-                )
+                    if report_id is None:
+                        report_id = await connection.fetchval(
+                            "SELECT id FROM reports WHERE source_message_id = $1",
+                            message.id,
+                        )
+                if report_id is None:
+                    raise RuntimeError(
+                        f"Could not persist or retrieve report for source message {message.id}."
+                    )
+                report_persisted = True
+                needs_dispatch = True
 
-            alert_channel_id = KANAL_ANTYCHEAT_ALERTY.get(message.guild.id)
-            alerts_channel = bot.get_channel(alert_channel_id) if alert_channel_id else None
-            if alerts_channel is None:
+            confirmation_sent = await _send_submission_notice(
+                message,
+                f"💚 Dziękujemy za zgłoszenie, {message.author.mention}! "
+                f"Twój plik {filename} został zapisany do weryfikacji."
+            )
+            if not confirmation_sent:
                 LOGGER.error(
-                    "Report %s is persisted but alert channel %s is unavailable; "
-                    "it will be retried when the bot reconnects",
+                    "Could not confirm persisted report %s; keeping source message %s",
                     report_id,
-                    alert_channel_id,
+                    message.id,
                 )
                 return
-            await _dispatch_report(report_id, alerts_channel)
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "Could not remove source message %s after report %s was persisted",
+                    message.id,
+                    report_id,
+                )
+                return
+
+            if needs_dispatch:
+                alert_channel_id = KANAL_ANTYCHEAT_ALERTY.get(message.guild.id)
+                alerts_channel = (
+                    bot.get_channel(alert_channel_id) if alert_channel_id else None
+                )
+                if alerts_channel is None:
+                    LOGGER.error(
+                        "Report %s is persisted but alert channel %s is unavailable; "
+                        "it will be retried when the bot reconnects",
+                        report_id,
+                        alert_channel_id,
+                    )
+                    return
+                await _dispatch_report(report_id, alerts_channel)
     except FileTooLargeError:
-        LOGGER.warning("Rejected oversized video from message %s", message.id)
+        LOGGER.warning("Report processing failed: video too large (message %s)", message.id)
+        await _send_submission_notice(
+            message,
+            "Nie udało się przyjąć zgłoszenia: plik przekracza dozwolony limit. "
+            "Wiadomość nie została usunięta."
+        )
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-        LOGGER.exception("Failed to download or process video from message %s", message.id)
+        LOGGER.exception("Report processing failed for message %s", message.id)
+        await _send_submission_notice(
+            message,
+            "Nie udało się przetworzyć zgłoszenia z powodu błędu pobierania lub pliku. "
+            "Wiadomość pozostała na kanale — spróbuj ponownie później."
+        )
     except Exception:
         LOGGER.exception("Failed to process or dispatch report for message %s", message.id)
+        if report_persisted:
+            status_message = (
+                "Zgłoszenie zostało zapisane, ale wystąpił problem z wysłaniem "
+                "powiadomienia do sędziów. System ponowi wysyłkę; nie wysyłaj "
+                "ponownie tego samego zgłoszenia."
+            )
+        else:
+            status_message = (
+                "Nie udało się przeanalizować lub zapisać zgłoszenia. "
+                "Wiadomość pozostała na kanale — spróbuj ponownie później."
+            )
+        await _send_submission_notice(message, status_message)
     finally:
         if temp_path is not None:
             try:
