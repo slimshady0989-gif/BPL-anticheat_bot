@@ -503,12 +503,18 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                 await tasks[2]
 
                 self.assertEqual(entered_downloads, 2)
+                self.assertIn("jest przetwarzane", messages[0].channel.send.await_args.args[0])
+                self.assertIn("jest przetwarzane", messages[1].channel.send.await_args.args[0])
                 messages[0].delete.assert_not_awaited()
                 messages[1].delete.assert_not_awaited()
                 messages[2].delete.assert_not_awaited()
+                messages[2].channel.send.assert_awaited_once()
         finally:
+            background_tasks = tuple(app._background_submission_tasks)
             release_downloads.set()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
             app.KANAL_ANTYCHEAT_MAGAZYN.pop(guild_id, None)
 
     async def test_executor_analysis_does_not_block_event_loop(self):
@@ -563,8 +569,13 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ):
                     await app.on_message(message)
+                    background_tasks = tuple(app._background_submission_tasks)
+                    if background_tasks:
+                        await asyncio.gather(*background_tasks, return_exceptions=True)
 
             self.assertEqual(list(Path(directory).glob("verify_*.mp4")), [])
+            message.delete.assert_not_awaited()
+            self.assertIn("Nie udało się przeanalizować", message.channel.send.return_value.edit.await_args.kwargs["content"])
             app.KANAL_ANTYCHEAT_MAGAZYN.pop(71, None)
 
     async def test_processing_capacity_rejects_excess_work_without_temp_file(self):
@@ -592,7 +603,7 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
             mkstemp.assert_not_called()
             download.assert_not_awaited()
             message.delete.assert_not_awaited()
-            message.channel.send.assert_not_awaited()
+            message.channel.send.assert_awaited_once()
         finally:
             semaphore.release()
             semaphore.release()
@@ -654,12 +665,25 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                             patch.object(app.bot, "add_view") as add_view,
                         ):
                             await app.on_message(message)
+                            background_tasks = tuple(app._background_submission_tasks)
+                            if background_tasks:
+                                await asyncio.gather(
+                                    *background_tasks, return_exceptions=True
+                                )
 
                         message.delete.assert_awaited_once()
                         message.channel.send.assert_awaited_once()
-                        self.assertEqual(
-                            message.channel.send.await_args.kwargs["delete_after"],
-                            15,
+                        self.assertIn(
+                            "jest przetwarzane",
+                            message.channel.send.await_args.args[0],
+                        )
+                        message.channel.send.return_value.edit.assert_awaited_once()
+                        self.assertIn(
+                            "został zapisany do weryfikacji",
+                            message.channel.send.return_value.edit.await_args.kwargs["content"],
+                        )
+                        message.channel.send.return_value.delete.assert_awaited_once_with(
+                            delay=15
                         )
                         report_channel.send.assert_awaited_once()
                         embed = report_channel.send.await_args.kwargs["embed"]

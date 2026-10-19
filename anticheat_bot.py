@@ -48,6 +48,7 @@ _persistent_view_registered = False
 _registered_report_message_ids = set()
 _report_locks = {}
 _report_locks_guard = asyncio.Lock()
+_background_submission_tasks = set()
 
 
 class FileTooLargeError(Exception):
@@ -696,6 +697,11 @@ class PersistentAdminView(discord.ui.View):
 class AntiCheatBot(commands.Bot):
     async def close(self):
         global database_pool
+        background_tasks = tuple(_background_submission_tasks)
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
         if database_pool is not None:
             await database_pool.close()
             database_pool = None
@@ -930,6 +936,33 @@ async def _send_submission_notice(message, content, delete_after=15):
     return True
 
 
+async def _send_submission_status(message, content):
+    try:
+        return await message.channel.send(content)
+    except discord.HTTPException:
+        LOGGER.exception(
+            "Could not send submission status for source message %s",
+            message.id,
+        )
+        return None
+
+
+async def _update_submission_status(
+    status_message, source_message_id, content, delete_after=None
+):
+    try:
+        await status_message.edit(content=content)
+        if delete_after is not None:
+            await status_message.delete(delay=delete_after)
+    except discord.HTTPException:
+        LOGGER.exception(
+            "Could not update submission status for source message %s",
+            source_message_id,
+        )
+        return False
+    return True
+
+
 @bot.event
 async def on_message(message):
     archive_channel_id = (
@@ -943,21 +976,77 @@ async def on_message(message):
         return
     if processing_semaphore.locked():
         LOGGER.warning("Rejecting video message %s: processing capacity is full", message.id)
+        await _send_submission_notice(
+            message,
+            "W tej chwili przetwarzane są inne zgłoszenia. "
+            "Wiadomość z wideo pozostała na kanale — spróbuj ponownie za chwilę."
+        )
         return
     if database_pool is None:
         LOGGER.error(
             "Cannot accept video message %s: database connection is not initialized",
             message.id,
         )
+        await _send_submission_notice(
+            message,
+            "Nie można teraz przyjąć zgłoszenia z powodu niedostępnej bazy danych. "
+            "Wiadomość z wideo pozostała na kanale — spróbuj ponownie później."
+        )
         return
 
     await processing_semaphore.acquire()
+    task_created = False
+    try:
+        status_message = await _send_submission_status(
+            message,
+            f"💚 Dziękujemy, {message.author.mention}! "
+            "Twoje zgłoszenie jest przetwarzane. Prosimy pozostawić tę wiadomość na kanale."
+        )
+        if status_message is None:
+            return
+
+        filename = _filename_from_message(message, video_url)
+        task = asyncio.create_task(
+            _process_submission(message, video_url, filename, status_message),
+            name=f"anticheat-report-{message.id}",
+        )
+        _background_submission_tasks.add(task)
+
+        def discard_completed_task(completed_task):
+            _background_submission_tasks.discard(completed_task)
+            if completed_task.cancelled():
+                return
+            error = completed_task.exception()
+            if error is not None:
+                LOGGER.error(
+                    "Background submission task failed for source message %s",
+                    message.id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(discard_completed_task)
+        task_created = True
+    except Exception:
+        LOGGER.exception(
+            "Could not schedule background processing for source message %s",
+            message.id,
+        )
+        await _send_submission_notice(
+            message,
+            "Nie udało się rozpocząć przetwarzania zgłoszenia. "
+            "Wiadomość z wideo pozostała na kanale — spróbuj ponownie później."
+        )
+    finally:
+        if not task_created:
+            processing_semaphore.release()
+
+
+async def _process_submission(message, video_url, filename, status_message):
     temp_path = None
     report_persisted = False
     needs_dispatch = False
     try:
         async with _lock_source_message(message.id):
-            filename = _filename_from_message(message, video_url)
             async with database_pool.acquire() as connection:
                 existing = await connection.fetchrow(
                     """
@@ -1025,28 +1114,6 @@ async def on_message(message):
                 report_persisted = True
                 needs_dispatch = True
 
-            confirmation_sent = await _send_submission_notice(
-                message,
-                f"💚 Dziękujemy za zgłoszenie, {message.author.mention}! "
-                f"Twój plik {filename} został zapisany do weryfikacji."
-            )
-            if not confirmation_sent:
-                LOGGER.error(
-                    "Could not confirm persisted report %s; keeping source message %s",
-                    report_id,
-                    message.id,
-                )
-                return
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                LOGGER.exception(
-                    "Could not remove source message %s after report %s was persisted",
-                    message.id,
-                    report_id,
-                )
-                return
-
             if needs_dispatch:
                 alert_channel_id = KANAL_ANTYCHEAT_ALERTY.get(message.guild.id)
                 alerts_channel = (
@@ -1059,36 +1126,66 @@ async def on_message(message):
                         report_id,
                         alert_channel_id,
                     )
+                    await _update_submission_status(
+                        status_message,
+                        message.id,
+                        "Zgłoszenie zostało zapisane, ale nie udało się powiadomić sędziów. "
+                        "System ponowi wysyłkę; wiadomość z wideo pozostała na kanale.",
+                    )
                     return
                 await _dispatch_report(report_id, alerts_channel)
+
+            status_updated = await _update_submission_status(
+                status_message,
+                message.id,
+                f"💚 Dziękujemy za zgłoszenie, {message.author.mention}! "
+                f"Plik {filename} został zapisany do weryfikacji.",
+                delete_after=15,
+            )
+            if not status_updated:
+                return
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "Could not remove source message %s after report %s was persisted",
+                    message.id,
+                    report_id,
+                )
     except FileTooLargeError:
         LOGGER.warning("Report processing failed: video too large (message %s)", message.id)
-        await _send_submission_notice(
-            message,
+        await _update_submission_status(
+            status_message,
+            message.id,
             "Nie udało się przyjąć zgłoszenia: plik przekracza dozwolony limit. "
             "Wiadomość nie została usunięta."
         )
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
         LOGGER.exception("Report processing failed for message %s", message.id)
-        await _send_submission_notice(
-            message,
+        await _update_submission_status(
+            status_message,
+            message.id,
             "Nie udało się przetworzyć zgłoszenia z powodu błędu pobierania lub pliku. "
             "Wiadomość pozostała na kanale — spróbuj ponownie później."
         )
     except Exception:
         LOGGER.exception("Failed to process or dispatch report for message %s", message.id)
         if report_persisted:
-            status_message = (
+            status_text = (
                 "Zgłoszenie zostało zapisane, ale wystąpił problem z wysłaniem "
                 "powiadomienia do sędziów. System ponowi wysyłkę; nie wysyłaj "
-                "ponownie tego samego zgłoszenia."
+                "ponownie tego samego zgłoszenia. Wiadomość z wideo pozostała na kanale."
             )
         else:
-            status_message = (
+            status_text = (
                 "Nie udało się przeanalizować lub zapisać zgłoszenia. "
                 "Wiadomość pozostała na kanale — spróbuj ponownie później."
             )
-        await _send_submission_notice(message, status_message)
+        await _update_submission_status(
+            status_message=status_message,
+            source_message_id=message.id,
+            content=status_text,
+        )
     finally:
         if temp_path is not None:
             try:
