@@ -40,3 +40,11 @@ Testy jednostkowe nie dowodzą braku wycieków w długim procesie ani niezawodno
    - `DATABASE_URL` (connection string Neon PostgreSQL; włącz SSL w konfiguracji Neon).
 
 Nie ustawiaj `ANTYCHEAT_MAGAZYN_ID` ani `ANTYCHEAT_ALERTY_ID`; kanały i ich ID są konfigurowane automatycznie po połączeniu z serwerem.
+
+
+## Rozszerzona analiza (multi-player)
+
+- anticheat_vision.py: YOLOv8-Nano (OpenCV DNN, CPU, models/yolov8n.onnx), tracking wielu graczy, OCR (Tesseract) timera/killfeedu/nametagow, detekcja snapu 8-kierunkowego + mikro-jitter (XIM/Cronus), fizyka Ballistic R (teleport, air-strafe).
+- anticheat_report.py: progi per gracz (srednia + 3 sigma z werdyktow VERIFIED_CLEAN) i plik Detailed_Analysis_ID.txt.
+- Tabela player_profiles (Welford, zapis tylko po VERIFIED_CLEAN); wszystkie wartosci fizyki Ballistic R sa konfigurowalne przez zmienne srodowiskowe (BALLISTIC_R_*, YOLO_*).
+- Wyniki to wskazowki dla sedziego, nie dowod. Testy: python -m unittest discover -s tests -v

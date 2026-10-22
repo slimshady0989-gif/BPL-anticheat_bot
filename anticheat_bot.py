@@ -1,4 +1,6 @@
 import asyncio
+import functools
+import io
 import logging
 import math
 import os
@@ -16,6 +18,9 @@ import discord
 import numpy as np
 from discord.ext import commands
 from dotenv import load_dotenv
+
+import anticheat_report as report_tools
+import anticheat_vision as vision
 
 load_dotenv()
 
@@ -85,6 +90,73 @@ def _initial_profile_stddev(profile):
     return (profile["max_legal_velocity"] - profile["base_avg_speed"]) / 3.0
 
 
+# Each statement is idempotent, touches only anti-cheat-owned tables and runs
+# on its own so no long multi-statement transaction ever holds locks.
+SCHEMA_UPGRADE_STATEMENTS = (
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS offender_name TEXT",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS anomaly_type TEXT",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS anomaly_second DOUBLE PRECISION",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS anomaly_clock TEXT",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS detail_log TEXT",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS lag_detected BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS offender_avg_speed DOUBLE PRECISION",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS offender_jitter_hz DOUBLE PRECISION",
+    "CREATE UNIQUE INDEX IF NOT EXISTS player_profiles_discord_id_unique_idx "
+    "ON player_profiles (discord_id) WHERE discord_id IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS player_profiles_epic_key_unique_idx "
+    "ON player_profiles (epic_key) WHERE epic_key IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS player_profiles_updated_idx "
+    "ON player_profiles (updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS reports_pending_idx "
+    "ON reports (id) WHERE report_status = 'PENDING'",
+    "CREATE INDEX IF NOT EXISTS reports_player_created_idx "
+    "ON reports (player_id, created_at DESC)",
+)
+
+# Welford update executed atomically inside the UPSERT (UPDATE expressions read
+# the pre-update row), so concurrent verdicts cannot lose a sample.
+_PROFILE_UPDATE_SET = """
+    sample_count = player_profiles.sample_count + 1,
+    speed_mean = player_profiles.speed_mean
+        + ($2 - player_profiles.speed_mean) / (player_profiles.sample_count + 1),
+    speed_m2 = player_profiles.speed_m2 + ($2 - player_profiles.speed_mean)
+        * ($2 - (player_profiles.speed_mean
+            + ($2 - player_profiles.speed_mean) / (player_profiles.sample_count + 1))),
+    jitter_mean = player_profiles.jitter_mean
+        + ($3 - player_profiles.jitter_mean) / (player_profiles.sample_count + 1),
+    jitter_m2 = player_profiles.jitter_m2 + ($3 - player_profiles.jitter_mean)
+        * ($3 - (player_profiles.jitter_mean
+            + ($3 - player_profiles.jitter_mean) / (player_profiles.sample_count + 1))),
+    variance_mean = player_profiles.variance_mean
+        + ($4 - player_profiles.variance_mean) / (player_profiles.sample_count + 1),
+    lag_clip_count = player_profiles.lag_clip_count + $5,
+    updated_at = NOW()
+"""
+# Parameters: $1 key (discord id / epic key), $2 speed, $3 jitter, $4 variance,
+# $5 lag flag (0/1), and for the epic-key variant $6 display nickname.
+PROFILE_UPSERT_BY_DISCORD_ID = f"""
+    INSERT INTO player_profiles
+        (discord_id, sample_count, speed_mean, speed_m2, jitter_mean, jitter_m2,
+         variance_mean, lag_clip_count)
+    VALUES ($1, 1, $2, 0, $3, 0, $4, $5)
+    ON CONFLICT (discord_id) WHERE discord_id IS NOT NULL DO UPDATE SET
+    {_PROFILE_UPDATE_SET}
+"""
+PROFILE_UPSERT_BY_EPIC_KEY = f"""
+    INSERT INTO player_profiles
+        (epic_key, sample_count, speed_mean, speed_m2, jitter_mean, jitter_m2,
+         variance_mean, lag_clip_count, epic_nickname)
+    VALUES ($1, 1, $2, 0, $3, 0, $4, $5, $6)
+    ON CONFLICT (epic_key) WHERE epic_key IS NOT NULL DO UPDATE SET
+    {_PROFILE_UPDATE_SET}
+"""
+NICKNAME_REGISTER_SQL = """
+    INSERT INTO player_profiles (epic_nickname, epic_key)
+    VALUES ($1, $2)
+    ON CONFLICT (epic_key) WHERE epic_key IS NOT NULL DO NOTHING
+"""
+
+
 async def initialize_database(pool):
     await pool.execute(
         """
@@ -103,6 +175,22 @@ async def initialize_database(pool):
         );
         ALTER TABLE control_profiles
             ADD COLUMN IF NOT EXISTS speed_m2 DOUBLE PRECISION NOT NULL DEFAULT 0;
+        CREATE TABLE IF NOT EXISTS player_profiles (
+            id BIGSERIAL PRIMARY KEY,
+            discord_id BIGINT,
+            epic_nickname TEXT,
+            epic_key TEXT,
+            sample_count BIGINT NOT NULL DEFAULT 0 CHECK (sample_count >= 0),
+            speed_mean DOUBLE PRECISION NOT NULL DEFAULT 0,
+            speed_m2 DOUBLE PRECISION NOT NULL DEFAULT 0,
+            jitter_mean DOUBLE PRECISION NOT NULL DEFAULT 0,
+            jitter_m2 DOUBLE PRECISION NOT NULL DEFAULT 0,
+            variance_mean DOUBLE PRECISION NOT NULL DEFAULT 0,
+            lag_clip_count BIGINT NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (discord_id IS NOT NULL OR epic_key IS NOT NULL)
+        );
         CREATE TABLE IF NOT EXISTS reports (
             id BIGSERIAL PRIMARY KEY,
             message_id BIGINT UNIQUE,
@@ -133,6 +221,8 @@ async def initialize_database(pool):
         ON reports (source_message_id)
         """
     )
+    for statement in SCHEMA_UPGRADE_STATEMENTS:
+        await pool.execute(statement)
     await pool.executemany(
         """
         INSERT INTO gadgets_mechanics (name, speed_multiplier, duration_seconds)
@@ -193,8 +283,16 @@ def _profile_threshold(profile):
 
 
 class SafeBallisticAnalyzer:
-    def procesuj_wideo_synchronicznie(self, video_path, control_profiles=None):
+    def procesuj_wideo_synchronicznie(
+        self,
+        video_path,
+        control_profiles=None,
+        player_profile=None,
+        roster=(),
+        mechanics=None,
+    ):
         cap = None
+        multi = None
         try:
             cap = cv2.VideoCapture(str(video_path))
             ret, first_frame = cap.read()
@@ -203,6 +301,7 @@ class SafeBallisticAnalyzer:
 
             reported_fps = cap.get(cv2.CAP_PROP_FPS)
             fps = reported_fps if np.isfinite(reported_fps) and reported_fps > 0 else 30.0
+            multi = self._create_multi_analyzer(first_frame, fps, roster, mechanics)
             prev_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
             first_position_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
             prev_timestamp = (
@@ -212,6 +311,7 @@ class SafeBallisticAnalyzer:
             )
             frame_idx = 0
             center_speeds = []
+            center_times = []
             overall_speeds = []
             center_vectors = []
             lag_detected = False
@@ -254,12 +354,14 @@ class SafeBallisticAnalyzer:
                     center_flow[..., 0], center_flow[..., 1]
                 )
                 center_speeds.append(float(np.mean(center_magnitude)))
+                center_times.append(timestamp)
                 center_vectors.append(
                     (
                         float(np.mean(center_flow[..., 0])),
                         float(np.mean(center_flow[..., 1])),
                     )
                 )
+                multi = self._feed_multi(multi, frame, flow, timestamp, frame_idx)
                 prev_gray = gray
                 prev_timestamp = timestamp
 
@@ -272,6 +374,7 @@ class SafeBallisticAnalyzer:
                     "magnitude_variance": 0.0,
                     "jitter_frequency": 0.0,
                     "control_type": "PAD",
+                    "multi": None,
                 }
 
             avg_speed = float(np.mean(center_speeds))
@@ -307,13 +410,20 @@ class SafeBallisticAnalyzer:
                 for name, profile in PROFILE_DEFAULTS.items()
             }
             profile = profiles[control_type]
-            threshold = _profile_threshold(profile)
+            base_threshold = _profile_threshold(profile)
+            threshold, threshold_source = report_tools.personalized_threshold(
+                player_profile, base_threshold
+            )
+            min_run = report_tools.adaptive_min_run(
+                player_profile, MIN_CONTINUOUS_ANOMALY_FRAMES
+            )
             over_threshold = [speed > threshold for speed in center_speeds]
             longest_run = 0
             current_run = 0
+            longest_run_end = -1
             longest_run_speeds = []
             current_run_speeds = []
-            for speed, above in zip(center_speeds, over_threshold):
+            for index, (speed, above) in enumerate(zip(center_speeds, over_threshold)):
                 if above:
                     current_run += 1
                     current_run_speeds.append(speed)
@@ -323,16 +433,16 @@ class SafeBallisticAnalyzer:
                 longest_run = max(longest_run, current_run)
                 if current_run == longest_run:
                     longest_run_speeds = current_run_speeds.copy()
+                    longest_run_end = index
 
-            transient_spike = any(over_threshold) and longest_run < MIN_CONTINUOUS_ANOMALY_FRAMES
+            transient_spike = any(over_threshold) and longest_run < min_run
             sustained_avg_speed = (
                 float(np.mean(longest_run_speeds)) if longest_run_speeds else 0.0
             )
-            anomalous = (
-                longest_run >= MIN_CONTINUOUS_ANOMALY_FRAMES
-                and sustained_avg_speed > threshold
-            )
+            anomalous = longest_run >= min_run and sustained_avg_speed > threshold
+            anomaly_second = None
             if anomalous:
+                anomaly_second = float(center_times[longest_run_end - longest_run + 1])
                 report = (
                     f"Utrzymująca się anomalia: {longest_run} klatek z rzędu; "
                     f"średni ruch celownika w serii {sustained_avg_speed:.2f}, "
@@ -352,8 +462,23 @@ class SafeBallisticAnalyzer:
                     f"Brak krytycznych odchyleń. Średni ruch celownika "
                     f"{avg_speed:.2f}; próg {threshold:.2f} (profil {control_type})."
                 )
+
+            multi_result = self._finalize_multi(
+                multi, video_path, frame_idx, jitter_frequency
+            )
+            findings = list(multi_result.findings) if multi_result else []
+            if findings:
+                report += "\n" + "\n".join(
+                    f"{finding.label} — {finding.offender or finding.entity_id} "
+                    f"@ {finding.video_second:.1f}s"
+                    + (f" (zegar {finding.clock})" if finding.clock else "")
+                    for finding in findings[:5]
+                )
+            anomaly_clock = None
+            if anomaly_second is not None and multi is not None:
+                anomaly_clock = vision.format_clock(multi.timer.clock_at(anomaly_second))
             return {
-                "alert": anomalous,
+                "alert": anomalous or bool(findings),
                 "raport": report,
                 "avg_speed": avg_speed,
                 "overall_avg_speed": float(np.mean(overall_speeds)),
@@ -361,8 +486,12 @@ class SafeBallisticAnalyzer:
                 "jitter_frequency": jitter_frequency,
                 "control_type": control_type,
                 "threshold": threshold,
+                "threshold_source": threshold_source,
                 "longest_anomaly_run": longest_run,
                 "lag_detected": lag_detected or transient_spike,
+                "anomaly_second": anomaly_second,
+                "anomaly_clock": anomaly_clock,
+                "multi": multi_result,
             }
         except cv2.error:
             LOGGER.warning("OpenCV could not decode video %s", video_path, exc_info=True)
@@ -371,19 +500,119 @@ class SafeBallisticAnalyzer:
             if cap is not None:
                 cap.release()
 
+    @staticmethod
+    def _create_multi_analyzer(first_frame, fps, roster, mechanics):
+        """Full-frame multi-player stage; failures must never block the legacy metrics."""
+        try:
+            height, width = first_frame.shape[:2]
+            impulse = (mechanics or {}).get("Impulse_Grenade", (3.0, 1.8))
+            return vision.MultiPlayerAnalyzer(
+                fps,
+                (width, height),
+                hud=vision.HudReader(roster=roster),
+                impulse_multiplier=float(impulse[0]),
+                impulse_duration=float(impulse[1]),
+            )
+        except Exception:
+            LOGGER.warning("Multi-player analysis disabled for this clip", exc_info=True)
+            return None
 
-async def analyze_video_async(analyzer, video_path, control_profiles=None):
+    @staticmethod
+    def _feed_multi(multi, frame, flow, timestamp, frame_idx):
+        if multi is None:
+            return None
+        try:
+            multi.process_frame(frame, flow, timestamp, frame_idx)
+        except Exception:
+            LOGGER.warning("Multi-player analysis aborted mid-clip", exc_info=True)
+            return None
+        return multi
+
+    @staticmethod
+    def _finalize_multi(multi, video_path, frame_count, jitter_hz):
+        if multi is None:
+            return None
+        try:
+            result = multi.finalize(jitter_hz)
+            events, audio_ok = multi.audio_visual_events(video_path, frame_count)
+            result.av_events = events
+            result.audio_available = audio_ok
+            return result
+        except Exception:
+            LOGGER.warning("Multi-player finalisation failed", exc_info=True)
+            return None
+
+
+async def analyze_video_async(analyzer, video_path, control_profiles=None, **context):
     loop = asyncio.get_running_loop()
-    if control_profiles is None:
-        return await loop.run_in_executor(
-            executor, analyzer.procesuj_wideo_synchronicznie, str(video_path)
+    if control_profiles is None and not context:
+        func = functools.partial(analyzer.procesuj_wideo_synchronicznie, str(video_path))
+    else:
+        kwargs_for_analyzer = {
+            "control_profiles": control_profiles,
+            "player_profile": context.get("player_profile"),
+            "roster": context.get("roster", ()),
+            "mechanics": context.get("mechanics"),
+        }
+        func = functools.partial(
+            analyzer.procesuj_wideo_synchronicznie, str(video_path), **kwargs_for_analyzer
         )
-    return await loop.run_in_executor(
-        executor,
-        analyzer.procesuj_wideo_synchronicznie,
-        str(video_path),
-        control_profiles,
-    )
+    return await loop.run_in_executor(executor, func)
+
+
+def _safe_float(value, default=0.0):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+async def _load_analysis_context(pool, player_id):
+    """Optional per-player data; any failure degrades to the global thresholds."""
+    context = {"player_profile": None, "roster": (), "mechanics": None}
+    try:
+        profile = await pool.fetchrow(
+            """
+            SELECT sample_count, speed_mean, speed_m2, lag_clip_count
+            FROM player_profiles WHERE discord_id = $1
+            """,
+            player_id,
+        )
+        context["player_profile"] = dict(profile) if profile else None
+        rows = await pool.fetch(
+            """
+            SELECT epic_nickname FROM player_profiles
+            WHERE epic_nickname IS NOT NULL
+            ORDER BY updated_at DESC LIMIT 2000
+            """
+        )
+        context["roster"] = tuple(
+            name for name in (_report_value(r, "epic_nickname", None) for r in rows) if name
+        )
+        rows = await pool.fetch(
+            "SELECT name, speed_multiplier, duration_seconds FROM gadgets_mechanics"
+        )
+        context["mechanics"] = {
+            r["name"]: (float(r["speed_multiplier"]), float(r["duration_seconds"]))
+            for r in rows
+            if _report_value(r, "name", None) and _report_value(r, "speed_multiplier", None)
+        } or None
+    except Exception:
+        LOGGER.warning("Could not load player/roster context; using defaults", exc_info=True)
+    return context
+
+
+async def _register_discovered_nicknames(pool, names):
+    """Auto-populate player_profiles with nicknames read from the HUD."""
+    for name in list(names)[:12]:
+        nickname = vision.clean_nickname(name)
+        if nickname is None:
+            continue
+        try:
+            await pool.execute(NICKNAME_REGISTER_SQL, nickname, nickname.lower())
+        except Exception:
+            LOGGER.warning("Could not register nickname %r", nickname, exc_info=True)
 
 
 def _report_id_from_interaction(interaction):
@@ -544,6 +773,14 @@ async def setup_server_channels(guild):
         return False
 
 
+LOCK_TIMEOUT_MS = 5000
+LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+
+
+def _is_lock_timeout(error):
+    return getattr(error, "sqlstate", None) == LOCK_NOT_AVAILABLE_SQLSTATE
+
+
 async def _review_report(interaction, status, selected_control_type=None):
     if interaction.guild is None or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
@@ -568,6 +805,7 @@ async def _review_report(interaction, status, selected_control_type=None):
     try:
         async with database_pool.acquire() as connection:
             async with connection.transaction():
+                await connection.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}';")
                 report = await connection.fetchrow(
                     "SELECT * FROM reports WHERE message_id = $1 FOR UPDATE",
                     interaction.message.id,
@@ -627,6 +865,14 @@ async def _review_report(interaction, status, selected_control_type=None):
                         report["id"],
                         selected_control_type,
                     )
+                    try:
+                        async with connection.transaction():
+                            await _store_clean_telemetry(connection, report)
+                    except Exception:
+                        LOGGER.exception(
+                            "Could not store player telemetry for report %s; verdict kept",
+                            report["id"],
+                        )
                 else:
                     await connection.execute(
                         "UPDATE reports SET report_status = 'VERIFIED_CHEAT' WHERE id = $1",
@@ -635,7 +881,17 @@ async def _review_report(interaction, status, selected_control_type=None):
                 updated = await connection.fetchrow(
                     "SELECT * FROM reports WHERE id = $1", report["id"]
                 )
-    except Exception:
+    except Exception as error:
+        if _is_lock_timeout(error):
+            LOGGER.warning(
+                "Lock timeout while reviewing report on message %s", interaction.message.id
+            )
+            await interaction.response.send_message(
+                "⏳ Raport jest chwilowo zablokowany przez inną transakcję "
+                "(inny sędzia lub usługa). Spróbuj ponownie za chwilę.",
+                ephemeral=True,
+            )
+            return
         LOGGER.exception("Failed to persist staff decision for report on message %s", interaction.message.id)
         await interaction.response.send_message(
             "❌ Nie udało się zapisać werdyktu. Raport pozostaje oczekujący.",
@@ -658,8 +914,56 @@ async def _review_report(interaction, status, selected_control_type=None):
     )
     try:
         await interaction.response.edit_message(embed=embed, view=None)
+    except discord.NotFound:
+        LOGGER.warning("Alert message for report %s no longer exists", updated["id"])
+        await _notify_ephemeral(
+            interaction, "✅ Werdykt zapisany, ale wiadomość alertu została już usunięta."
+        )
     except discord.HTTPException:
         LOGGER.exception("Could not update anti-cheat alert after staff review")
+        await _notify_ephemeral(
+            interaction, "✅ Werdykt zapisany, ale nie udało się zaktualizować wiadomości alertu."
+        )
+
+
+async def _notify_ephemeral(interaction, text):
+    try:
+        response = interaction.response
+        is_done = getattr(response, "is_done", None)
+        if callable(is_done) and is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await response.send_message(text, ephemeral=True)
+    except (discord.HTTPException, AttributeError):
+        LOGGER.warning("Could not deliver ephemeral staff notice", exc_info=True)
+
+
+async def _store_clean_telemetry(connection, report):
+    """Persist baselines only for judge-verified clean clips (Welford upsert)."""
+    lag_flag = 1 if bool(_report_value(report, "lag_detected", False)) else 0
+    player_id = _report_value(report, "player_id", None)
+    if player_id is not None:
+        await connection.execute(
+            PROFILE_UPSERT_BY_DISCORD_ID,
+            int(player_id),
+            _safe_float(_report_value(report, "avg_speed", 0.0)),
+            _safe_float(_report_value(report, "jitter_frequency", 0.0)),
+            _safe_float(_report_value(report, "magnitude_variance", 0.0)),
+            lag_flag,
+        )
+    offender = _report_value(report, "offender_name", None)
+    offender_speed = _report_value(report, "offender_avg_speed", None)
+    nickname = vision.clean_nickname(offender) if offender and offender_speed is not None else None
+    if nickname is not None:
+        await connection.execute(
+            PROFILE_UPSERT_BY_EPIC_KEY,
+            nickname.lower(),
+            _safe_float(offender_speed),
+            _safe_float(_report_value(report, "offender_jitter_hz", 0.0)),
+            0.0,
+            lag_flag,
+            nickname,
+        )
 
 
 class PersistentAdminView(discord.ui.View):
@@ -837,6 +1141,30 @@ def _report_embed(report):
             + "\n```\n*To sygnał do ręcznej weryfikacji, nie werdykt ani dowód oszustwa.*"
         )
     embed.add_field(
+        name="Plik", value=filename or "n/d", inline=True
+    )
+    embed.add_field(
+        name="Zgłaszający (POV / ofiara)", value=f"{player_name} (ID: {player_id})"[:1024], inline=True
+    )
+    offender = _single_line(_report_value(report, "offender_name", "") or "—", 200)
+    embed.add_field(name="Wykryty przeciwnik", value=offender, inline=True)
+    anomaly_type = _single_line(
+        _report_value(report, "anomaly_type", "") or "Brak wykrytej anomalii", 200
+    )
+    embed.add_field(name="Typ anomalii", value=anomaly_type, inline=False)
+    second = _report_value(report, "anomaly_second", None)
+    clock = _report_value(report, "anomaly_clock", "")
+    second_text = _finite_metric(report, "anomaly_second", 2)
+    embed.add_field(
+        name="Dokładna sekunda anomalii",
+        value=(
+            "n/d"
+            if second is None or second_text == "n/d"
+            else f"{second_text} s wideo" + (f" · zegar rundy {clock}" if clock else "")
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="ID raportu",
         value=str(_report_value(report, "id", "n/d"))[:100],
         inline=False,
@@ -868,6 +1196,20 @@ async def _lock_source_message(message_id):
                 _report_locks[message_id] = (lock, references - 1)
 
 
+def _detail_attachment(report):
+    report_id = _report_value(report, "id", "n/d")
+    text = str(_report_value(report, "detail_log", "") or "")
+    if not text:
+        text = (
+            f"BPL ANTI-CHEAT ANALYSIS - REPORT {report_id}\n\n"
+            f"{_report_value(report, 'raw_report_text', 'No detailed log stored.')}\n"
+        )
+    text = text.replace(report_tools.REPORT_ID_TOKEN, str(report_id))
+    return discord.File(
+        io.BytesIO(text.encode("utf-8")), filename=f"Detailed_Analysis_{report_id}.txt"
+    )
+
+
 async def _dispatch_report(report_id, alert_channel):
     async with database_pool.acquire() as connection:
         async with connection.transaction():
@@ -880,6 +1222,7 @@ async def _dispatch_report(report_id, alert_channel):
                 return report["message_id"]
             alert_message = await alert_channel.send(
                 embed=_report_embed(report),
+                file=_detail_attachment(report),
                 view=PersistentAdminView(),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -1065,14 +1408,45 @@ async def _process_submission(message, video_url, filename, status_message):
                 )
             else:
                 profiles = await _load_control_profiles(database_pool)
+                analysis_context = await _load_analysis_context(
+                    database_pool, message.author.id
+                )
                 fd, temp_path = tempfile.mkstemp(prefix="verify_", suffix=".mp4")
                 os.close(fd)
                 await download_video(video_url, temp_path)
                 result = await analyze_video_async(
-                    SafeBallisticAnalyzer(), temp_path, profiles
+                    SafeBallisticAnalyzer(), temp_path, profiles, **analysis_context
                 )
                 if result.get("powod"):
                     raise RuntimeError(result["powod"])
+
+                offender, anomaly_type, anomaly_second, anomaly_clock = (
+                    report_tools.summarize_anomaly(result)
+                )
+                detail_log = report_tools.build_detailed_analysis(
+                    result,
+                    {
+                        "filename": filename,
+                        "player_name": str(message.author),
+                        "player_id": message.author.id,
+                    },
+                )
+                headline = report_tools.headline_finding(result)
+                offender_stats = None
+                if headline is not None and headline.offender:
+                    offender_stats = next(
+                        (
+                            entity
+                            for entity in result["multi"].entities
+                            if entity["entity_id"] == headline.entity_id
+                        ),
+                        None,
+                    )
+                multi = result.get("multi")
+                discovered = list(getattr(multi, "discovered_nicknames", []) or [])
+                if headline is not None and headline.offender:
+                    discovered.append(headline.offender)
+                await _register_discovered_nicknames(database_pool, discovered)
 
                 async with database_pool.acquire() as connection:
                     report_id = await connection.fetchval(
@@ -1080,9 +1454,12 @@ async def _process_submission(message, video_url, filename, status_message):
                         INSERT INTO reports (
                             source_message_id, guild_id, player_id, player_name, video_url,
                             control_type, avg_speed, magnitude_variance, jitter_frequency,
-                            is_anomalous, report_status, raw_report_text
+                            is_anomalous, report_status, raw_report_text,
+                            offender_name, anomaly_type, anomaly_second, anomaly_clock,
+                            detail_log, lag_detected, offender_avg_speed, offender_jitter_hz
                         )
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'PENDING', $11)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'PENDING', $11,
+                                $12, $13, $14, $15, $16, $17, $18, $19)
                         ON CONFLICT (source_message_id) DO NOTHING
                         RETURNING id
                         """,
@@ -1101,6 +1478,14 @@ async def _process_submission(message, video_url, filename, status_message):
                             f"Średnia prędkość globalna kadru: "
                             f"{result.get('overall_avg_speed', 0.0):.2f}."
                         ),
+                        offender,
+                        anomaly_type,
+                        anomaly_second,
+                        anomaly_clock,
+                        detail_log,
+                        bool(result.get("lag_detected", False)),
+                        offender_stats["avg_speed"] if offender_stats else None,
+                        offender_stats["jitter_hz"] if offender_stats else None,
                     )
                     if report_id is None:
                         report_id = await connection.fetchval(

@@ -1,6 +1,7 @@
 discord.py==2.3.2
-opencv-python-headless==4.8.1.78
-numpy==1.26.1
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
 aiohttp==3.8.6
 asyncpg==0.30.0
 python-dotenv==1.0.0
+pytesseract==0.3.13

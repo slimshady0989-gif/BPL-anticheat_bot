@@ -146,6 +146,8 @@ class FakeDatabasePool:
     async def fetch(self, query):
         if "FROM reports" in query:
             return self.pending_rows
+        if "FROM player_profiles" in query or "FROM gadgets_mechanics" in query:
+            return []
         return list(self.profiles.values())
 
     async def fetchval(self, query, *args):
@@ -165,12 +167,25 @@ class FakeDatabasePool:
             "report_status": "PENDING",
             "raw_report_text": args[10],
         }
+        if len(args) >= 19:
+            self.report.update(
+                offender_name=args[11],
+                anomaly_type=args[12],
+                anomaly_second=args[13],
+                anomaly_clock=args[14],
+                detail_log=args[15],
+                lag_detected=args[16],
+                offender_avg_speed=args[17],
+                offender_jitter_hz=args[18],
+            )
         self.next_report_id += 1
         return self.report["id"]
 
     async def fetchrow(self, query, *args):
         if "FROM control_profiles" in query:
             return self.profiles[args[0]]
+        if "FROM player_profiles" in query:
+            return None
         return self.report
 
     async def execute(self, query, *args):
@@ -206,8 +221,12 @@ class DatabaseInitializationTests(unittest.IsolatedAsyncioTestCase):
                 ("Sliding", 1.4, 1.2),
             ],
         )
-        self.assertEqual(pool.execute.await_count, 5)
-        seeded_profiles = [call.args for call in pool.execute.await_args_list[3:]]
+        self.assertIn("CREATE TABLE IF NOT EXISTS player_profiles", ddl)
+        seeded_profiles = [
+            call.args
+            for call in pool.execute.await_args_list
+            if "INSERT INTO control_profiles" in call.args[0]
+        ]
         self.assertEqual(
             [(args[1], args[2], args[3], args[4]) for args in seeded_profiles],
             [
@@ -754,6 +773,28 @@ class AdminViewTests(unittest.IsolatedAsyncioTestCase):
             ["ac_clean_kbm", "ac_clean_pad", "ac_cheat_detected"],
         )
         self.assertTrue(view.is_persistent())
+
+    async def test_lock_timeout_notifies_staff_without_crashing(self):
+        class LockError(Exception):
+            sqlstate = "55P03"
+
+        database = FakeDatabasePool(report={"id": 9, "message_id": 5678, "report_status": "PENDING"})
+        database.fetchrow = AsyncMock(side_effect=LockError("lock not available"))
+        app.KANAL_ANTYCHEAT_ALERTY[55] = 888
+        response = SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock())
+        interaction = SimpleNamespace(
+            guild_id=55,
+            channel_id=888,
+            guild=object(),
+            user=SimpleNamespace(guild_permissions=SimpleNamespace(administrator=True)),
+            response=response,
+            message=SimpleNamespace(id=5678, embeds=[]),
+        )
+        with patch.object(app, "database_pool", database):
+            await app.PersistentAdminView().children[0].callback(interaction)
+
+        response.edit_message.assert_not_awaited()
+        self.assertIn("zablokowany", response.send_message.await_args.args[0])
 
     async def test_clean_verdict_updates_profile_once_and_edits_alert(self):
         report = {
