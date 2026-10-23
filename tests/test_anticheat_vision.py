@@ -238,16 +238,16 @@ class EmbedFieldTests(unittest.TestCase):
         }
         embed = app._report_embed(report)
         names = [field.name for field in embed.fields]
+        self.assertIn("ID raportu w bazie Neon", names)
         for expected in (
-            "Plik",
-            "Wykryty przeciwnik",
-            "Typ anomalii",
-            "Dokładna sekunda anomalii",
+            "Wykryty Przeciwnik",
+            "Typ Wykrytej Anomalii",
+            "Czas zdarzenia na wideo",
+            "1:48",
+            "ShadowWolf",
+            "12.40s",
         ):
-            self.assertIn(expected, names)
-        values = " ".join(field.value for field in embed.fields)
-        self.assertIn("ShadowWolf", values)
-        self.assertIn("12.4", values)
+            self.assertIn(expected, embed.description)
 
 
 class PhysicsConstantsTests(unittest.TestCase):

@@ -253,8 +253,8 @@ class ReportEmbedTests(unittest.TestCase):
 
         embed = app._report_embed(report)
 
-        self.assertIn("Średni ruch celownika:** 0.00", embed.description)
-        self.assertIn("Wariancja pędu:** n/d", embed.description)
+        self.assertIn("Średni ruch celownika (POV):** 0.00", embed.description)
+        self.assertIn("Wariancja pędu celownika:** n/d", embed.description)
         self.assertIn("Częstotliwość mikro-szarpnięć:** n/d Hz", embed.description)
         self.assertLessEqual(len(embed.description), 4096)
         self.assertEqual(embed.description.count("```"), 2)
@@ -709,7 +709,7 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("clip one.mp4", embed.description)
                         self.assertIn("(ID: 123)", embed.description)
                         self.assertIn(
-                            "[Otwórz wideo](https://example.test/clips/clip%20one.mp4)",
+                            "[Otwórz wideo w przeglądarce](https://example.test/clips/clip%20one.mp4)",
                             embed.description,
                         )
                         self.assertIn(
@@ -722,14 +722,14 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                         )
                         self.assertEqual(
                             embed.title,
-                            "⚠️ WYKRYTO POTENCJALNĄ ANOMALIĘ RUCHU"
+                            "⚠️ ALERT: WYKRYTO POTENCJALNĄ ANOMALIĘ RUCHU / FIZYKI"
                             if anomalous
-                            else "✅ MATERIAŁ ZWERYFIKOWANY - RUCH W NORMIE",
+                            else "✅ ANTY-CHEAT: MATERIAŁ W NORMIE",
                         )
                         self.assertIn(
-                            "🔴 WYKRYTO ODCHYLENIA OD NORMY"
+                            "🔴 WYKRYTO KRYTYCZNE ODCHYLENIA OD NORMY"
                             if anomalous
-                            else "🟢 CZYSTO (Brak podejrzanych zachowań)",
+                            else "🟢 CZYSTO (Ruch i fizyka w normie)",
                             embed.description,
                         )
                         self.assertEqual(

@@ -1097,40 +1097,67 @@ def _report_embed(report):
     player_name = _single_line(_report_value(report, "player_name", "Nieznany"), 100)
     player_id = _single_line(_report_value(report, "player_id", "n/d"), 32)
     control_type = _single_line(_report_value(report, "control_type", "n/d"), 16)
+
+    offender = _single_line(_report_value(report, "offender_name", "") or "—", 200)
+    anomaly_type = _single_line(
+        _report_value(report, "anomaly_type", "") or "Brak wykrytej anomalii", 200
+    )
+    clock = _single_line(_report_value(report, "anomaly_clock", ""), 40)
+    second_text = _finite_metric(report, "anomaly_second", 2)
+
     raw_report = str(_report_value(report, "raw_report_text", "Brak szczegółów raportu."))
     raw_report = raw_report.replace("```", "'''")[:1800]
+
     numeric_stats = (
-        f"**Średni ruch celownika:** {_finite_metric(report, 'avg_speed', 2)}\n"
-        f"**Wariancja pędu:** {_finite_metric(report, 'magnitude_variance', 4)}\n"
-        f"**Częstotliwość mikro-szarpnięć:** "
-        f"{_finite_metric(report, 'jitter_frequency', 2)} Hz\n"
+        f"**Średni ruch celownika (POV):** {_finite_metric(report, 'avg_speed', 2)}\n"
+        f"**Wariancja pędu celownika:** {_finite_metric(report, 'magnitude_variance', 4)}\n"
+        f"**Częstotliwość mikro-szarpnięć:** {_finite_metric(report, 'jitter_frequency', 2)} Hz\n"
     )
+    if offender != "—" and offender != "POV (kamera zgłaszającego)":
+        offender_speed = _finite_metric(report, "offender_avg_speed", 2)
+        offender_jitter = _finite_metric(report, "offender_jitter_hz", 2)
+        numeric_stats += f"**Średnia prędkość oskarżonego:** {offender_speed}\n"
+        numeric_stats += f"**Jitter oskarżonego:** {offender_jitter} Hz\n"
+
     status_text = (
-        "🔴 WYKRYTO ODCHYLENIA OD NORMY"
+        "🔴 WYKRYTO KRYTYCZNE ODCHYLENIA OD NORMY"
         if anomalous
-        else "🟢 CZYSTO (Brak podejrzanych zachowań)"
+        else "🟢 CZYSTO (Ruch i fizyka w normie)"
     )
     video_link = quote(video_url, safe=":/?&=%#[]!$'*+,;@")
+
     embed = discord.Embed(
         title=(
-            "⚠️ WYKRYTO POTENCJALNĄ ANOMALIĘ RUCHU"
+            "⚠️ ALERT: WYKRYTO POTENCJALNĄ ANOMALIĘ RUCHU / FIZYKI"
             if anomalous
-            else "✅ MATERIAŁ ZWERYFIKOWANY - RUCH W NORMIE"
+            else "✅ ANTY-CHEAT: MATERIAŁ W NORMIE"
         ),
         color=discord.Color.orange() if anomalous else discord.Color.green(),
     )
-    embed.description = (
-        "**Materiały do ręcznej weryfikacji przez sędziego:**\n"
-        f"**Plik:** {filename}\n"
-        f"**Gracz:** {player_name} (ID: {player_id})\n"
-        f"**Wideo:** [Otwórz wideo]({video_link})\n"
-        f"**Profil sterowania:** {control_type}\n"
-        f"{numeric_stats}\n"
-        f"**Status:** {status_text}\n\n"
-        "**Logi analizatora wizyjnego:**\n"
-        f"```text\n{raw_report}\n```\n"
-        "*To sygnał do ręcznej weryfikacji, nie werdykt ani dowód oszustwa.*"
+
+    footer_note = (
+        "*Powyższe dane stanowią wynik automatycznej analizy i asysty dla sędziów BPL. "
+        "Nie stanowią ostatecznego wyroku.*"
     )
+    embed.description = (
+        "**Materiały do analizy i weryfikacji sędziowskiej:**\n\n"
+        f"**Plik wideo:** `{filename}`\n"
+        f"**Zgłaszający (POV):** {player_name} (ID: {player_id})\n"
+        f"**Wykryty Przeciwnik:** ` {offender} `\n"
+        f"**Typ Wykrytej Anomalii:** `{anomaly_type}`\n"
+        f"**Czas zdarzenia na wideo:** "
+        + (f"`{second_text}s`" if second_text != "n/d" else "`n/d`")
+        + (f" · ⏱️ Zegar rundy: `{clock}`" if clock else "")
+        + "\n"
+        f"**Profil sterowania (POV):** `{control_type}`\n\n"
+        f"**Metryki szczegółowe:**\n{numeric_stats}\n"
+        f"**Status bota:** {status_text}\n\n"
+        f"**Dowód wideo:** [Otwórz wideo w przeglądarce]({video_link})\n\n"
+        "**Logi z analizatora wizyjnego:**\n"
+        f"```text\n{raw_report}\n```\n"
+        f"{footer_note}"
+    )
+
     if len(embed.description) > 4096:
         overflow = len(embed.description) - 4096
         raw_report = raw_report[: max(0, len(raw_report) - overflow - 4)]
@@ -1138,40 +1165,16 @@ def _report_embed(report):
             embed.description.split("```text\n", 1)[0]
             + "```text\n"
             + raw_report
-            + "\n```\n*To sygnał do ręcznej weryfikacji, nie werdykt ani dowód oszustwa.*"
+            + "\n```\n"
+            + footer_note
         )
+
     embed.add_field(
-        name="Plik", value=filename or "n/d", inline=True
+        name="ID raportu w bazie Neon",
+        value=f"` #{_report_value(report, 'id', 'n/d')} `"[:1024],
+        inline=True,
     )
-    embed.add_field(
-        name="Zgłaszający (POV / ofiara)", value=f"{player_name} (ID: {player_id})"[:1024], inline=True
-    )
-    offender = _single_line(_report_value(report, "offender_name", "") or "—", 200)
-    embed.add_field(name="Wykryty przeciwnik", value=offender, inline=True)
-    anomaly_type = _single_line(
-        _report_value(report, "anomaly_type", "") or "Brak wykrytej anomalii", 200
-    )
-    embed.add_field(name="Typ anomalii", value=anomaly_type, inline=False)
-    second = _report_value(report, "anomaly_second", None)
-    clock = _report_value(report, "anomaly_clock", "")
-    second_text = _finite_metric(report, "anomaly_second", 2)
-    embed.add_field(
-        name="Dokładna sekunda anomalii",
-        value=(
-            "n/d"
-            if second is None or second_text == "n/d"
-            else f"{second_text} s wideo" + (f" · zegar rundy {clock}" if clock else "")
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="ID raportu",
-        value=str(_report_value(report, "id", "n/d"))[:100],
-        inline=False,
-    )
-    embed.set_footer(
-        text=f"Raport #{_report_value(report, 'id', 'n/d')} · System asysty sędziowskiej BPL"
-    )
+    embed.set_footer(text=f"BPL Anti-Cheat Assistant · Raport #{_report_value(report, 'id', 'n/d')}")
     return embed
 
 
