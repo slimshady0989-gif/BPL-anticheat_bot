@@ -61,6 +61,9 @@ SNAP_MIN_SAMPLES = 30
 SNAP_WINDOW_S = 2.0
 SNAP_MIN_DIRECTION_SHARE = 0.15
 ENTITY_JITTER_HZ_MIN = _env_float("ENTITY_JITTER_HZ_MIN", 9.0)
+ARTIFACT_WINDOW_S = _env_float("ARTIFACT_WINDOW_S", 1.5)
+ARTIFACT_BRIGHTNESS_JUMP = _env_float("ARTIFACT_BRIGHTNESS_JUMP", 28.0)
+ARTIFACT_COLOR_COVERAGE_MIN = _env_float("ARTIFACT_COLOR_COVERAGE_MIN", 0.22)
 
 # Ballistic R physics (frame-widths per second, camera compensated)
 BALLISTIC_R_ROUND_SECONDS = _env_float("BALLISTIC_R_ROUND_SECONDS", 120.0)
@@ -138,6 +141,7 @@ class MultiPlayerResult:
     kill_events: list = field(default_factory=list)
     av_events: list = field(default_factory=list)
     impulse_windows: list = field(default_factory=list)
+    artifact_windows: list = field(default_factory=list)
     discovered_nicknames: list = field(default_factory=list)
     detector_name: str = "none"
     ocr_available: bool = False
@@ -785,6 +789,34 @@ def _in_window(t, windows):
     return any(start <= t <= end for start, end in windows)
 
 
+def _jitter_outside_windows(vectors, times, duration_s, windows):
+    """Measure jitter only in contiguous samples outside physics/visual events."""
+    if not windows:
+        return micro_jitter_hz(vectors, duration_s)
+    safe_segments = []
+    current = []
+    for vector, timestamp in zip(vectors, times):
+        if _in_window(float(timestamp), windows):
+            if current:
+                safe_segments.append(current)
+                current = []
+        else:
+            current.append((vector, float(timestamp)))
+    if current:
+        safe_segments.append(current)
+    observed_duration = 0.0
+    weighted_jitter = 0.0
+    for segment in safe_segments:
+        segment_duration = segment[-1][1] - segment[0][1]
+        if len(segment) < 10 or segment_duration <= 0:
+            continue
+        weighted_jitter += micro_jitter_hz(
+            [vector for vector, _ in segment], segment_duration
+        ) * segment_duration
+        observed_duration += segment_duration
+    return weighted_jitter / observed_duration if observed_duration else 0.0
+
+
 class PhysicsValidator:
     def __init__(self, impulse_multiplier=3.0, timer=None):
         self.impulse_multiplier = impulse_multiplier
@@ -915,7 +947,7 @@ class PhysicsValidator:
 # ---------------------------------------------------------------------------
 # Locomotion (hardware emulator) analysis
 # ---------------------------------------------------------------------------
-def analyze_locomotion(track, fps, timer=None):
+def analyze_locomotion(track, fps, timer=None, impulse_windows=(), artifact_windows=()):
     """Windowed 8-direction snapping + micro-jitter check for one entity."""
     samples = track.samples
     if len(samples) < SNAP_MIN_SAMPLES:
@@ -930,7 +962,25 @@ def analyze_locomotion(track, fps, timer=None):
         window = vectors[mask]
         if len(window) >= SNAP_MIN_SAMPLES:
             snap = analyze_octant_snapping(window, MIN_MOVE_SPEED_FW_S)
-            jitter = micro_jitter_hz([(s.vx, s.vy) for s, m in zip(samples, mask) if m], SNAP_WINDOW_S)
+            selected_samples = [sample for sample, selected in zip(samples, mask) if selected]
+            selected_vectors = [(sample.vx, sample.vy) for sample in selected_samples]
+            active_windows = [*impulse_windows, *artifact_windows]
+            strict_wasd = (
+                snap.samples >= SNAP_MIN_SAMPLES
+                and snap.snapped_ratio >= SNAP_RATIO_MIN
+                and snap.distinct_directions >= 2
+                and snap.diagonal_share >= SNAP_MIN_DIRECTION_SHARE
+            )
+            jitter = (
+                _jitter_outside_windows(
+                    selected_vectors,
+                    [sample.video_second for sample in selected_samples],
+                    SNAP_WINDOW_S,
+                    active_windows,
+                )
+                if strict_wasd
+                else micro_jitter_hz(selected_vectors, SNAP_WINDOW_S)
+            )
             if (
                 snap.samples >= SNAP_MIN_SAMPLES
                 and snap.snapped_ratio >= SNAP_RATIO_MIN
@@ -1054,6 +1104,8 @@ class MultiPlayerAnalyzer:
         self.tracker = EntityTracker(self.small_size, fps)
         self.timer = TimerTracker()
         self.impulses = ImpulseWindowDetector(impulse_duration, fps)
+        self.artifact_windows = []
+        self._previous_brightness = None
         self.physics = PhysicsValidator(impulse_multiplier, self.timer)
         self.kill_events = []
         self.flash_series = []
@@ -1079,6 +1131,22 @@ class MultiPlayerAnalyzer:
         height, width = small.shape[:2]
         roi = small[int(height * 0.3) : int(height * 0.7), int(width * 0.35) : int(width * 0.75)]
         self.flash_series.append(float(np.mean(roi)) if roi.size else 0.0)
+        brightness = float(np.mean(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)))
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        yellow = cv2.inRange(hsv, np.array((18, 100, 100)), np.array((38, 255, 255)))
+        violet = cv2.inRange(hsv, np.array((125, 70, 70)), np.array((165, 255, 255)))
+        color_coverage = float(np.count_nonzero(yellow | violet)) / max(height * width, 1)
+        brightness_jump = (
+            self._previous_brightness is not None
+            and abs(brightness - self._previous_brightness) >= ARTIFACT_BRIGHTNESS_JUMP
+        )
+        self._previous_brightness = brightness
+        if brightness_jump or color_coverage >= ARTIFACT_COLOR_COVERAGE_MIN:
+            end = video_second + ARTIFACT_WINDOW_S
+            if self.artifact_windows and video_second <= self.artifact_windows[-1][1]:
+                self.artifact_windows[-1] = (self.artifact_windows[-1][0], end)
+            else:
+                self.artifact_windows.append((video_second, end))
         self.impulses.add(video_second, float(np.mean(np.linalg.norm(flow_small[::4, ::4], axis=2))))
 
         self.tracker.advance(flow_small, cam, video_second, frame_index)
@@ -1130,13 +1198,32 @@ class MultiPlayerAnalyzer:
         findings = []
         entities = []
         for track in tracks:
-            finding, snap = analyze_locomotion(track, self.fps, self.timer)
+            finding, snap = analyze_locomotion(
+                track, self.fps, self.timer,
+                self.impulses.windows, self.artifact_windows
+            )
             if finding:
                 findings.append(finding)
             speeds = np.array([math.hypot(s.vx, s.vy) for s in track.samples])
             vectors = [(s.vx, s.vy) for s in track.samples]
             duration = max(track.samples[-1].video_second - track.samples[0].video_second, 1e-6)
             snap_all = analyze_octant_snapping(vectors, MIN_MOVE_SPEED_FW_S)
+            strict_wasd = (
+                snap_all.samples >= SNAP_MIN_SAMPLES
+                and snap_all.snapped_ratio >= SNAP_RATIO_MIN
+                and snap_all.distinct_directions >= 2
+                and snap_all.diagonal_share >= SNAP_MIN_DIRECTION_SHARE
+            )
+            entity_jitter = (
+                _jitter_outside_windows(
+                    vectors,
+                    [sample.video_second for sample in track.samples],
+                    duration,
+                    [*self.impulses.windows, *self.artifact_windows],
+                )
+                if strict_wasd
+                else micro_jitter_hz(vectors, duration)
+            )
             entities.append(
                 {
                     "entity_id": track.entity_id,
@@ -1146,7 +1233,7 @@ class MultiPlayerAnalyzer:
                     "speed_variance": float(np.var(speeds)),
                     "max_speed": float(np.max(speeds)),
                     "snapped_ratio": snap_all.snapped_ratio,
-                    "jitter_hz": micro_jitter_hz(vectors, duration),
+                    "jitter_hz": entity_jitter,
                     "first_second": track.samples[0].video_second,
                     "last_second": track.samples[-1].video_second,
                 }
@@ -1198,6 +1285,7 @@ class MultiPlayerAnalyzer:
             timer_readings=list(self.timer.readings),
             kill_events=list(self.kill_events),
             impulse_windows=list(self.impulses.windows),
+            artifact_windows=list(self.artifact_windows),
             discovered_nicknames=discovered[:12],
             detector_name=getattr(self.detector, "name", "custom"),
             ocr_available=self.hud.available,

@@ -10,6 +10,7 @@ LAG_PRONE_RATIO = 0.25
 MAX_LOG_CHARS = 1_500_000
 MAX_MATRIX_ROWS = 4000
 REPORT_ID_TOKEN = "{{REPORT_ID}}"
+CALIBRATION_ROUND = 1
 
 
 # ---------------------------------------------------------------------------
@@ -28,16 +29,47 @@ def lag_ratio(profile):
     return float(_field(profile, "lag_clip_count", 0)) / count if count else 0.0
 
 
-def personalized_threshold(profile, fallback_threshold):
+def calibration_statistics(baseline, value):
+    """Return a baseline-relative z-score and one-sided normal tail probability."""
+    if not baseline or int(_field(baseline, "league_round", 0)) != CALIBRATION_ROUND:
+        return None, None
+    count = int(_field(baseline, "sample_count", 0))
+    if count < 2:
+        return None, None
+    mean = float(_field(baseline, "base_avg_speed", 0.0))
+    variance = max(float(_field(baseline, "speed_m2", 0.0)) / (count - 1), 0.0)
+    sigma = math.sqrt(variance)
+    if not math.isfinite(mean) or not math.isfinite(sigma) or sigma <= 0:
+        return None, None
+    z_score = (float(value) - mean) / sigma
+    probability = 0.5 * math.erfc(z_score / math.sqrt(2.0))
+    return z_score, probability
+
+
+def personalized_threshold(profile, fallback_threshold, calibration_baseline=None):
     """Player-specific mean + 3 sigma, blended with the control-type fallback.
 
     Returns ``(threshold, source)``. Until ``MIN_PROFILE_SAMPLES`` judge-verified
     clean clips exist the control-profile threshold is used unchanged. Players
     with a history of desync/lag get a proportionally wider threshold.
     """
+    baseline_version = None
+    if calibration_baseline:
+        if int(_field(calibration_baseline, "league_round", 0)) != CALIBRATION_ROUND:
+            raise ValueError("Anti-cheat calibration must use Kolejka 1 data.")
+        baseline_count = int(_field(calibration_baseline, "sample_count", 0))
+        if baseline_count >= 2:
+            baseline_m2 = max(float(_field(calibration_baseline, "speed_m2", 0.0)), 0.0)
+            baseline_sigma = math.sqrt(baseline_m2 / (baseline_count - 1))
+            fallback_threshold = (
+                float(_field(calibration_baseline, "base_avg_speed"))
+                + 3.0 * baseline_sigma
+            )
+            baseline_version = _field(calibration_baseline, "calibration_version", None)
     count = int(_field(profile, "sample_count", 0)) if profile else 0
     if count < MIN_PROFILE_SAMPLES:
-        return float(fallback_threshold), "control-profile"
+        source = f"kolejka-1:{baseline_version}" if baseline_version else "control-profile"
+        return float(fallback_threshold), source
     mean = float(_field(profile, "speed_mean"))
     sigma = math.sqrt(max(float(_field(profile, "speed_m2")), 0.0) / (count - 1))
     sigma = max(sigma, 0.1 * abs(mean))
@@ -48,7 +80,10 @@ def personalized_threshold(profile, fallback_threshold):
     personal = max(personal, 0.5 * fallback_threshold)
     weight = min(1.0, count / (3.0 * MIN_PROFILE_SAMPLES))
     blended = weight * personal + (1.0 - weight) * fallback_threshold
-    return float(blended), f"player-profile (n={count}, w={weight:.2f})"
+    source = f"player-profile (n={count}, w={weight:.2f})"
+    if baseline_version:
+        source = f"kolejka-1:{baseline_version} + {source}"
+    return float(blended), source
 
 
 def adaptive_min_run(profile, base_frames):
@@ -136,6 +171,10 @@ def build_detailed_analysis(result, meta):
         f"{_num(result.get('jitter_frequency'), 2)} Hz",
         f"Threshold used         : {_num(result.get('threshold'))} "
         f"[{result.get('threshold_source', 'control-profile')}]",
+        f"Calibration            : {result.get('calibration_version', 'legacy-default')}",
+        f"Baseline z-score / tail probability: "
+        f"{_num(result.get('baseline_z_score'), 2)} / "
+        f"{_num(result.get('baseline_probability'), 4)}",
         f"Longest over-threshold run: {result.get('longest_anomaly_run', 0)} frames | "
         f"lag/desync suspected: {bool(result.get('lag_detected'))}",
         "",

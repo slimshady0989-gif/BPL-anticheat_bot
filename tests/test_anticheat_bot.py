@@ -199,6 +199,8 @@ class FakeDatabasePool:
             self.report["control_type"] = args[1]
         elif "VERIFIED_CHEAT" in query:
             self.report["report_status"] = "VERIFIED_CHEAT"
+        elif "MANUAL_REVIEW" in query:
+            self.report["report_status"] = "MANUAL_REVIEW"
         elif "SET message_id" in query:
             self.report["message_id"] = args[1]
 
@@ -234,6 +236,26 @@ class DatabaseInitializationTests(unittest.IsolatedAsyncioTestCase):
                 ("PAD", 11.2, 26.5, 50),
             ],
         )
+
+    async def test_control_profile_calibration_requires_one_shared_version(self):
+        profiles = [
+            {"control_type": "KBM", "base_avg_speed": 1.0, "max_legal_velocity": 2.0,
+             "sample_count": 10, "speed_m2": 1.0},
+            {"control_type": "PAD", "base_avg_speed": 1.0, "max_legal_velocity": 2.0,
+             "sample_count": 10, "speed_m2": 1.0},
+        ]
+        baselines = [
+            {"control_type": "KBM", "league_round": 1, "calibration_version": "k1-v1",
+             "base_avg_speed": 1.0, "max_legal_velocity": 2.0, "sample_count": 10,
+             "speed_m2": 1.0},
+            {"control_type": "PAD", "league_round": 1, "calibration_version": "k1-v2",
+             "base_avg_speed": 1.0, "max_legal_velocity": 2.0, "sample_count": 10,
+             "speed_m2": 1.0},
+        ]
+        pool = SimpleNamespace(fetch=AsyncMock(side_effect=[profiles, baselines]))
+
+        with self.assertRaisesRegex(RuntimeError, "versions must match"):
+            await app._load_control_profiles(pool)
 
 
 class ReportEmbedTests(unittest.TestCase):
@@ -746,6 +768,15 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdminViewTests(unittest.IsolatedAsyncioTestCase):
+    def test_youtube_and_twitch_links_are_accepted_for_stream_resolution(self):
+        for url in (
+            "https://youtu.be/video-id",
+            "https://www.youtube.com/watch?v=video-id",
+            "https://www.twitch.tv/channel",
+        ):
+            message = SimpleNamespace(attachments=[], content=url)
+            self.assertEqual(app._video_url_from_message(message), url)
+
     async def test_non_admin_gets_ephemeral_denial_without_deleting_archive(self):
         app.KANAL_ANTYCHEAT_ALERTY[44] = 888
         interaction = SimpleNamespace(
@@ -765,14 +796,50 @@ class AdminViewTests(unittest.IsolatedAsyncioTestCase):
         get_channel.assert_not_called()
         app.KANAL_ANTYCHEAT_ALERTY.pop(44, None)
 
-    async def test_view_has_three_restart_persistent_verdict_buttons(self):
+    async def test_view_has_four_restart_persistent_verdict_buttons(self):
         view = app.PersistentAdminView()
 
         self.assertEqual(
             [button.custom_id for button in view.children],
-            ["ac_clean_kbm", "ac_clean_pad", "ac_cheat_detected"],
+            ["ac_clean_kbm", "ac_clean_pad", "ac_cheat_detected", "ac_unknown_review"],
         )
         self.assertTrue(view.is_persistent())
+
+    async def test_manual_review_does_not_change_control_profiles(self):
+        database = FakeDatabasePool(report={
+            "id": 84, "message_id": 5680, "report_status": "PENDING",
+            "control_type": "PAD", "avg_speed": 42.0,
+        })
+        original_profiles = {
+            name: profile.copy() for name, profile in database.profiles.items()
+        }
+        app.KANAL_ANTYCHEAT_ALERTY[60] = 892
+        response = SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock())
+        interaction = SimpleNamespace(
+            guild_id=60,
+            channel_id=892,
+            guild=object(),
+            user=SimpleNamespace(guild_permissions=SimpleNamespace(administrator=True)),
+            response=response,
+            message=SimpleNamespace(
+                id=5680, embeds=[discord.Embed(title="Pending review")]
+            ),
+        )
+
+        with patch.object(app, "database_pool", database):
+            await app.PersistentAdminView().children[3].callback(interaction)
+
+        self.assertEqual(database.report["report_status"], "MANUAL_REVIEW")
+        self.assertEqual(database.profiles, original_profiles)
+        self.assertEqual(
+            response.edit_message.await_args.kwargs["embed"].color.value,
+            discord.Color.orange().value,
+        )
+        self.assertIn(
+            "MANUALNA OBSERWACJA",
+            response.edit_message.await_args.kwargs["embed"].title,
+        )
+        app.KANAL_ANTYCHEAT_ALERTY.pop(60, None)
 
     async def test_lock_timeout_notifies_staff_without_crashing(self):
         class LockError(Exception):

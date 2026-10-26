@@ -5,3 +5,4 @@ aiohttp==3.8.6
 asyncpg==0.30.0
 python-dotenv==1.0.0
 pytesseract==0.3.13
+yt-dlp>=2024.1.0

@@ -16,6 +16,7 @@ import asyncpg
 import cv2
 import discord
 import numpy as np
+import yt_dlp
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -37,6 +38,7 @@ ANTICHEAT_CATEGORY_NAME = "🏆 BPL ANTI-CHEAT"
 ANTICHEAT_ARCHIVE_CHANNEL = "ac-magazyn-plikow"
 ANTICHEAT_ALERT_CHANNEL = "ac-alerty-sedziowskie"
 MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024
+MAX_LIVE_ANALYSIS_SECONDS = float(os.getenv("MAX_LIVE_ANALYSIS_SECONDS", "3600"))
 DOWNLOAD_CHUNK_BYTES = 1024
 MIN_CONTINUOUS_ANOMALY_FRAMES = 4
 CENTER_CROP_SIZE = 64
@@ -93,6 +95,9 @@ def _initial_profile_stddev(profile):
 # Each statement is idempotent, touches only anti-cheat-owned tables and runs
 # on its own so no long multi-statement transaction ever holds locks.
 SCHEMA_UPGRADE_STATEMENTS = (
+    "ALTER TABLE reports DROP CONSTRAINT IF EXISTS reports_report_status_check",
+    "ALTER TABLE reports ADD CONSTRAINT reports_report_status_check "
+    "CHECK (report_status IN ('PENDING', 'VERIFIED_CLEAN', 'VERIFIED_CHEAT', 'MANUAL_REVIEW'))",
     "ALTER TABLE reports ADD COLUMN IF NOT EXISTS offender_name TEXT",
     "ALTER TABLE reports ADD COLUMN IF NOT EXISTS anomaly_type TEXT",
     "ALTER TABLE reports ADD COLUMN IF NOT EXISTS anomaly_second DOUBLE PRECISION",
@@ -173,6 +178,17 @@ async def initialize_database(pool):
             sample_count BIGINT NOT NULL CHECK (sample_count >= 0),
             speed_m2 DOUBLE PRECISION NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS control_profile_baselines (
+            control_type TEXT NOT NULL CHECK (control_type IN ('KBM', 'PAD')),
+            league_round INTEGER NOT NULL CHECK (league_round = 1),
+            calibration_version TEXT NOT NULL,
+            base_avg_speed DOUBLE PRECISION NOT NULL,
+            max_legal_velocity DOUBLE PRECISION NOT NULL,
+            sample_count BIGINT NOT NULL CHECK (sample_count >= 2),
+            speed_m2 DOUBLE PRECISION NOT NULL CHECK (speed_m2 >= 0),
+            recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (control_type, calibration_version)
+        );
         ALTER TABLE control_profiles
             ADD COLUMN IF NOT EXISTS speed_m2 DOUBLE PRECISION NOT NULL DEFAULT 0;
         CREATE TABLE IF NOT EXISTS player_profiles (
@@ -205,7 +221,8 @@ async def initialize_database(pool):
             jitter_frequency DOUBLE PRECISION NOT NULL DEFAULT 0,
             is_anomalous BOOLEAN NOT NULL DEFAULT FALSE,
             report_status TEXT NOT NULL DEFAULT 'PENDING'
-                CHECK (report_status IN ('PENDING', 'VERIFIED_CLEAN', 'VERIFIED_CHEAT')),
+                CHECK (report_status IN ('PENDING', 'VERIFIED_CLEAN', 'VERIFIED_CHEAT',
+                                         'MANUAL_REVIEW')),
             raw_report_text TEXT NOT NULL DEFAULT '',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
@@ -263,6 +280,42 @@ async def _load_control_profiles(pool):
     missing = set(PROFILE_DEFAULTS) - profiles.keys()
     if missing:
         raise RuntimeError(f"Database is missing control profiles: {', '.join(sorted(missing))}")
+    baselines = await pool.fetch(
+        """
+        SELECT DISTINCT ON (control_type)
+               control_type, league_round, calibration_version, base_avg_speed,
+               max_legal_velocity, sample_count, speed_m2
+        FROM control_profile_baselines
+        WHERE league_round = 1
+        ORDER BY control_type, recorded_at DESC
+        """
+    )
+    baselines = [
+        dict(baseline)
+        for baseline in baselines
+        if "calibration_version" in baseline
+    ]
+    if baselines and len(baselines) != len(PROFILE_DEFAULTS):
+        raise RuntimeError(
+            "Kolejka 1 calibration is incomplete; expected one baseline per control type."
+        )
+    if baselines:
+        calibration_versions = {
+            baseline["calibration_version"] for baseline in baselines
+        }
+        if len(calibration_versions) != 1:
+            raise RuntimeError(
+                "Kolejka 1 calibration versions must match across control types."
+            )
+        for baseline in baselines:
+            profiles[baseline["control_type"]].update(
+                calibration_baseline=dict(baseline),
+                calibration_version=baseline["calibration_version"],
+            )
+    else:
+        LOGGER.warning(
+            "No Kolejka 1 anti-cheat calibration found; using legacy control profiles."
+        )
     return profiles
 
 
@@ -309,12 +362,15 @@ class SafeBallisticAnalyzer:
                 if np.isfinite(first_position_ms) and first_position_ms >= 0
                 else 0.0
             )
+            clip_start_timestamp = prev_timestamp
             frame_idx = 0
             center_speeds = []
             center_times = []
             overall_speeds = []
             center_vectors = []
             lag_detected = False
+            live_limit_reached = False
+            is_live_source = urlparse(str(video_path)).scheme in ("http", "https")
 
             while cap.isOpened():
                 ret, frame = cap.read()
@@ -364,6 +420,12 @@ class SafeBallisticAnalyzer:
                 multi = self._feed_multi(multi, frame, flow, timestamp, frame_idx)
                 prev_gray = gray
                 prev_timestamp = timestamp
+                if (
+                    is_live_source
+                    and timestamp - clip_start_timestamp >= MAX_LIVE_ANALYSIS_SECONDS
+                ):
+                    live_limit_reached = True
+                    break
 
             if not center_speeds:
                 return {
@@ -412,7 +474,7 @@ class SafeBallisticAnalyzer:
             profile = profiles[control_type]
             base_threshold = _profile_threshold(profile)
             threshold, threshold_source = report_tools.personalized_threshold(
-                player_profile, base_threshold
+                player_profile, base_threshold, profile.get("calibration_baseline")
             )
             min_run = report_tools.adaptive_min_run(
                 player_profile, MIN_CONTINUOUS_ANOMALY_FRAMES
@@ -462,6 +524,16 @@ class SafeBallisticAnalyzer:
                     f"Brak krytycznych odchyleń. Średni ruch celownika "
                     f"{avg_speed:.2f}; próg {threshold:.2f} (profil {control_type})."
                 )
+            calibration_baseline = profile.get("calibration_baseline")
+            baseline_z_score, baseline_probability = report_tools.calibration_statistics(
+                calibration_baseline,
+                sustained_avg_speed if anomalous else avg_speed,
+            )
+            if live_limit_reached:
+                report += (
+                    f" Analiza transmisji zakończona na skonfigurowanym limicie "
+                    f"{MAX_LIVE_ANALYSIS_SECONDS:.0f} s."
+                )
 
             multi_result = self._finalize_multi(
                 multi, video_path, frame_idx, jitter_frequency
@@ -487,10 +559,14 @@ class SafeBallisticAnalyzer:
                 "control_type": control_type,
                 "threshold": threshold,
                 "threshold_source": threshold_source,
+                "calibration_version": profile.get("calibration_version", "legacy-default"),
+                "baseline_z_score": baseline_z_score,
+                "baseline_probability": baseline_probability,
                 "longest_anomaly_run": longest_run,
                 "lag_detected": lag_detected or transient_spike,
                 "anomaly_second": anomaly_second,
                 "anomaly_clock": anomaly_clock,
+                "live_limit_reached": live_limit_reached,
                 "multi": multi_result,
             }
         except cv2.error:
@@ -534,7 +610,10 @@ class SafeBallisticAnalyzer:
             return None
         try:
             result = multi.finalize(jitter_hz)
-            events, audio_ok = multi.audio_visual_events(video_path, frame_count)
+            if urlparse(str(video_path)).scheme in ("http", "https"):
+                events, audio_ok = [], False
+            else:
+                events, audio_ok = multi.audio_visual_events(video_path, frame_count)
             result.av_events = events
             result.audio_available = audio_ok
             return result
@@ -873,9 +952,14 @@ async def _review_report(interaction, status, selected_control_type=None):
                             "Could not store player telemetry for report %s; verdict kept",
                             report["id"],
                         )
-                else:
+                elif status == "VERIFIED_CHEAT":
                     await connection.execute(
                         "UPDATE reports SET report_status = 'VERIFIED_CHEAT' WHERE id = $1",
+                        report["id"],
+                    )
+                else:
+                    await connection.execute(
+                        "UPDATE reports SET report_status = 'MANUAL_REVIEW' WHERE id = $1",
                         report["id"],
                     )
                 updated = await connection.fetchrow(
@@ -900,11 +984,19 @@ async def _review_report(interaction, status, selected_control_type=None):
         return
 
     embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
-    is_clean = updated["report_status"] == "VERIFIED_CLEAN"
-    embed.color = discord.Color.green() if is_clean else discord.Color.red()
+    report_status = updated["report_status"]
+    is_clean = report_status == "VERIFIED_CLEAN"
+    is_manual_review = report_status == "MANUAL_REVIEW"
+    embed.color = (
+        discord.Color.green() if is_clean
+        else discord.Color.orange() if is_manual_review
+        else discord.Color.red()
+    )
     embed.title = (
         f"✅ ZWERYFIKOWANO JAKO CZYSTE — {updated['control_type']}"
         if is_clean
+        else "🟠 MANUALNA OBSERWACJA SĘDZIOWSKA"
+        if is_manual_review
         else "🔴 POTWIERDZONY CHEAT"
     )
     embed.add_field(
@@ -997,6 +1089,15 @@ class PersistentAdminView(discord.ui.View):
     async def confirmed_cheat(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _review_report(interaction, "VERIFIED_CHEAT")
 
+    @discord.ui.button(
+        label="Nie wiem / Obserwacja Sędziowska",
+        style=discord.ButtonStyle.secondary,
+        custom_id="ac_unknown_review",
+        emoji="🤔",
+    )
+    async def manual_review(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _review_report(interaction, "MANUAL_REVIEW")
+
 
 class AntiCheatBot(commands.Bot):
     async def close(self):
@@ -1051,9 +1152,49 @@ def _video_url_from_message(message):
 
     for url in re.findall(r"https?://[^\s<>]+", message.content):
         clean_url = url.rstrip(".,!?)]}")
-        if urlparse(clean_url).path.lower().endswith((".mp4", ".mov")):
+        parsed = urlparse(clean_url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if parsed.path.lower().endswith((".mp4", ".mov")) or (
+            host == "youtu.be"
+            or host == "youtube.com"
+            or host.endswith(".youtube.com")
+            or host == "twitch.tv"
+            or host.endswith(".twitch.tv")
+        ):
             return clean_url
     return None
+
+
+def _resolve_video_source(video_url):
+    """Return a direct media URL for supported video pages; do not download VODs."""
+    host = (urlparse(video_url).hostname or "").lower()
+    supported = (
+        host == "youtu.be"
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "twitch.tv"
+        or host.endswith(".twitch.tv")
+    )
+    if not supported:
+        return video_url, False
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "format": "best[protocol^=https]/best",
+        "skip_download": True,
+    }
+    with yt_dlp.YoutubeDL(options) as extractor:
+        info = extractor.extract_info(video_url, download=False)
+    direct_url = info.get("url") if info else None
+    if not direct_url:
+        formats = info.get("requested_formats", []) if info else []
+        direct_url = formats[0].get("url") if formats else None
+    if not direct_url:
+        raise RuntimeError("yt-dlp did not return a playable stream URL.")
+    return direct_url, True
 
 
 def _filename_from_message(message, video_url):
@@ -1414,11 +1555,16 @@ async def _process_submission(message, video_url, filename, status_message):
                 analysis_context = await _load_analysis_context(
                     database_pool, message.author.id
                 )
-                fd, temp_path = tempfile.mkstemp(prefix="verify_", suffix=".mp4")
-                os.close(fd)
-                await download_video(video_url, temp_path)
+                analysis_source, is_stream = await asyncio.to_thread(
+                    _resolve_video_source, video_url
+                )
+                if not is_stream:
+                    fd, temp_path = tempfile.mkstemp(prefix="verify_", suffix=".mp4")
+                    os.close(fd)
+                    await download_video(analysis_source, temp_path)
+                    analysis_source = temp_path
                 result = await analyze_video_async(
-                    SafeBallisticAnalyzer(), temp_path, profiles, **analysis_context
+                    SafeBallisticAnalyzer(), analysis_source, profiles, **analysis_context
                 )
                 if result.get("powod"):
                     raise RuntimeError(result["powod"])

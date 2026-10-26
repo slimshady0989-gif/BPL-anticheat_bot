@@ -4,7 +4,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 
@@ -46,6 +46,26 @@ class OctantSnappingTests(unittest.TestCase):
     def test_smooth_motion_has_no_jitter(self):
         vectors = [(8.0, 0.0)] * 120
         self.assertEqual(vision.micro_jitter_hz(vectors, 2.0), 0.0)
+
+    def test_strict_wasd_jitter_is_ignored_inside_impulse_window(self):
+        samples = [
+            vision.Sample(index / 20, index, 0, 0, 4 if index % 2 else -4, 0)
+            for index in range(40)
+        ]
+        track = SimpleNamespace(samples=samples, entity_id="E1")
+        strict_snap = vision.SnapResult(40, 0.95, 4, 0.5)
+        with (
+            patch.object(
+                vision, "analyze_octant_snapping", return_value=strict_snap
+            ),
+            patch.object(vision, "micro_jitter_hz", return_value=12.0),
+        ):
+            finding, snap = vision.analyze_locomotion(
+                track, 20, impulse_windows=[(0.0, 2.0)]
+            )
+
+        self.assertIsNone(finding)
+        self.assertIsNone(snap)
 
 
 class ParsingTests(unittest.TestCase):
@@ -153,6 +173,24 @@ class ProfileThresholdTests(unittest.TestCase):
         self.assertGreater(
             report_tools.adaptive_min_run(lagged, 5), report_tools.adaptive_min_run(clean, 5)
         )
+
+    def test_threshold_and_probability_are_versioned_to_kolejka_one_baseline(self):
+        baseline = {
+            "league_round": 1,
+            "calibration_version": "k1-2026-v1",
+            "sample_count": 30,
+            "base_avg_speed": 10.0,
+            "speed_m2": 29 * 4.0,
+        }
+        threshold, source = report_tools.personalized_threshold(
+            None, 99.0, calibration_baseline=baseline
+        )
+        z_score, probability = report_tools.calibration_statistics(baseline, 16.0)
+
+        self.assertEqual(threshold, 16.0)
+        self.assertIn("k1-2026-v1", source)
+        self.assertEqual(z_score, 3.0)
+        self.assertAlmostEqual(probability, 0.0013499, places=6)
 
 
 def _finding(kind="HARDWARE_EMULATOR", offender="ShadowWolf"):
