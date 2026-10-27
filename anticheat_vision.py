@@ -1015,24 +1015,52 @@ def analyze_locomotion(track, fps, timer=None, impulse_windows=(), artifact_wind
 # ---------------------------------------------------------------------------
 # Audio / visual sync
 # ---------------------------------------------------------------------------
-def extract_audio_envelope(video_path, fps, frame_count, timeout=60):
+def extract_audio_envelope(video_path, fps, frame_count):
     """Per-frame RMS of the clip audio via ffmpeg, or None when unavailable."""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None or fps <= 0:
         return None
     rate = 16000
+    source = str(video_path)
+    timeout = 60 if source.lower().startswith(("http://", "https://")) else 300
     try:
         completed = subprocess.run(
-            [ffmpeg, "-v", "error", "-i", str(video_path), "-vn", "-ac", "1",
-             "-ar", str(rate), "-f", "s16le", "-"],
+            [
+                ffmpeg,
+                "-v",
+                "error",
+                "-i",
+                source,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(rate),
+                "-f",
+                "s16le",
+                "-",
+            ],
             capture_output=True,
             timeout=timeout,
-            check=False,
+            check=True,
         )
-    except (OSError, subprocess.SubprocessError):
-        LOGGER.warning("ffmpeg audio extraction failed", exc_info=True)
+    except subprocess.TimeoutExpired:
+        LOGGER.error("ffmpeg audio extraction timed out after %s seconds", timeout)
         return None
-    if completed.returncode != 0 or len(completed.stdout) < rate:
+    except subprocess.CalledProcessError:
+        LOGGER.error("ffmpeg audio extraction returned a failure", exc_info=True)
+        return None
+    except OSError:
+        LOGGER.error("could not execute ffmpeg for audio extraction", exc_info=True)
+        return None
+    except Exception:
+        LOGGER.exception("unexpected ffmpeg audio extraction failure")
+        return None
+    if not completed.stdout:
+        LOGGER.warning("ffmpeg audio extraction returned an empty payload")
+        return None
+    if len(completed.stdout) < rate:
+        LOGGER.warning("ffmpeg audio extraction returned less than one second of audio")
         return None
     audio = np.frombuffer(completed.stdout, dtype=np.int16).astype(np.float64) / 32768.0
     per_frame = max(int(rate / fps), 1)

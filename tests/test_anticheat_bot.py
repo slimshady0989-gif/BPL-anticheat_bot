@@ -237,6 +237,39 @@ class DatabaseInitializationTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_production_model_download_replaces_missing_or_small_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / "models" / "yolov8n.onnx"
+            model_path.parent.mkdir()
+            model_path.write_bytes(b"placeholder")
+
+            def download(_url, filename):
+                Path(filename).write_bytes(b"x" * app.YOLO_MODEL_MIN_BYTES)
+
+            with (
+                patch.object(app, "YOLO_MODEL_PATH", model_path),
+                patch.object(app.urllib.request, "urlretrieve", side_effect=download) as retrieve,
+            ):
+                self.assertTrue(app.download_production_yolo_model())
+
+            self.assertEqual(model_path.stat().st_size, app.YOLO_MODEL_MIN_BYTES)
+            retrieve.assert_called_once_with(app.YOLO_MODEL_URL, unittest.mock.ANY)
+
+    def test_production_model_download_failure_is_reported_without_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / "models" / "yolov8n.onnx"
+            with (
+                patch.object(app, "YOLO_MODEL_PATH", model_path),
+                patch.object(
+                    app.urllib.request,
+                    "urlretrieve",
+                    side_effect=OSError("network unavailable"),
+                ),
+                self.assertLogs(app.LOGGER, level="ERROR"),
+            ):
+                self.assertFalse(app.download_production_yolo_model())
+            self.assertFalse(model_path.exists())
+
     async def test_control_profile_calibration_requires_one_shared_version(self):
         profiles = [
             {"control_type": "KBM", "base_avg_speed": 1.0, "max_legal_velocity": 2.0,
@@ -1130,19 +1163,34 @@ class DynamicChannelSetupTests(unittest.IsolatedAsyncioTestCase):
     async def test_on_ready_provisions_every_guild_and_registers_persistent_view_once(self):
         guilds = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
         database = FakeDatabasePool()
+        call_order = []
+
+        async def run_in_thread(function):
+            call_order.append("model")
+            return function()
+
+        async def initialize_database_with_order(_database):
+            call_order.append("database")
+
         with (
             patch.object(app.bot, "_connection", SimpleNamespace(guilds=guilds)),
             patch.object(app, "setup_server_channels", new_callable=AsyncMock) as setup,
             patch.object(app.bot, "add_view") as add_view,
             patch.object(app, "database_pool", None),
             patch.object(app.asyncpg, "create_pool", new_callable=AsyncMock, return_value=database),
-            patch.object(app, "initialize_database", new_callable=AsyncMock),
+            patch.object(app, "download_production_yolo_model", return_value=True) as download_model,
+            patch.object(app.asyncio, "to_thread", side_effect=run_in_thread),
+            patch.object(
+                app, "initialize_database", side_effect=initialize_database_with_order
+            ),
             patch.dict(os.environ, {"DATABASE_URL": "postgresql://test"}),
         ):
             app._persistent_view_registered = False
             await app.on_ready()
             await app.on_ready()
 
+        self.assertEqual(call_order, ["model", "database", "model", "database"])
+        self.assertEqual(download_model.call_count, 2)
         self.assertEqual(setup.await_count, 4)
         self.assertEqual(
             [call.args[0] for call in setup.await_args_list],

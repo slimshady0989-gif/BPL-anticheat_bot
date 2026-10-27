@@ -299,6 +299,49 @@ class PhysicsConstantsTests(unittest.TestCase):
         self.assertTrue(hasattr(vision.PhysicsValidator, "__init__"))
 
 
+class AudioExtractionTests(unittest.TestCase):
+    def test_network_and_local_sources_use_different_timeouts(self):
+        completed = vision.subprocess.CompletedProcess(
+            args=["ffmpeg"], returncode=0, stdout=b"\x00\x00" * 16000
+        )
+        with (
+            patch.object(vision.shutil, "which", return_value="ffmpeg"),
+            patch.object(vision.subprocess, "run", return_value=completed) as run,
+        ):
+            vision.extract_audio_envelope("https://example.test/live", 30, 30)
+            self.assertEqual(run.call_args.kwargs["timeout"], 60)
+            vision.extract_audio_envelope("clip.mp4", 30, 30)
+            self.assertEqual(run.call_args.kwargs["timeout"], 300)
+
+    def test_ffmpeg_failures_and_empty_payload_return_none(self):
+        failures = (
+            vision.subprocess.TimeoutExpired("ffmpeg", 60),
+            vision.subprocess.CalledProcessError(1, "ffmpeg"),
+            OSError("ffmpeg is unavailable"),
+            RuntimeError("unexpected failure"),
+        )
+        with patch.object(vision.shutil, "which", return_value="ffmpeg"):
+            for failure in failures:
+                with self.subTest(failure=type(failure).__name__):
+                    with patch.object(
+                        vision.subprocess, "run", side_effect=failure
+                    ):
+                        self.assertIsNone(
+                            vision.extract_audio_envelope(
+                                "https://example.test/live", 30, 30
+                            )
+                        )
+
+            empty = vision.subprocess.CompletedProcess(
+                args=["ffmpeg"], returncode=0, stdout=b""
+            )
+            with patch.object(vision.subprocess, "run", return_value=empty):
+                with self.assertLogs(vision.LOGGER, level="WARNING"):
+                    self.assertIsNone(
+                        vision.extract_audio_envelope("clip.mp4", 30, 30)
+                    )
+
+
 class ClipSmokeTests(unittest.TestCase):
     CLIP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "test clip")
 

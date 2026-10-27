@@ -6,6 +6,7 @@ import math
 import os
 import re
 import tempfile
+import urllib.request
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -27,6 +28,56 @@ load_dotenv()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 LOGGER = logging.getLogger("bpl.anticheat")
+
+YOLO_MODEL_PATH = Path(vision.YOLO_MODEL_PATH)
+YOLO_MODEL_URL = (
+    "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8n.onnx"
+)
+YOLO_MODEL_MIN_BYTES = 1_000_000
+
+
+def download_production_yolo_model():
+    """Ensure the configured YOLOv8 ONNX model is present and non-placeholder."""
+    model_directory = YOLO_MODEL_PATH.parent
+    temporary_path = None
+    try:
+        model_directory.mkdir(parents=True, exist_ok=True)
+        if (
+            YOLO_MODEL_PATH.is_file()
+            and YOLO_MODEL_PATH.stat().st_size >= YOLO_MODEL_MIN_BYTES
+        ):
+            return True
+
+        with tempfile.NamedTemporaryFile(
+            dir=model_directory,
+            prefix="yolov8n-",
+            suffix=".download",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+
+        urllib.request.urlretrieve(YOLO_MODEL_URL, str(temporary_path))
+        if temporary_path.stat().st_size < YOLO_MODEL_MIN_BYTES:
+            raise ValueError("Downloaded YOLOv8 ONNX model is smaller than 1 MB.")
+
+        os.replace(temporary_path, YOLO_MODEL_PATH)
+        temporary_path = None
+        LOGGER.info("Verified production YOLOv8 model at %s", YOLO_MODEL_PATH)
+        return True
+    except Exception:
+        LOGGER.exception("Could not verify or download the production YOLOv8 model")
+        return False
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning(
+                    "Could not remove temporary YOLO model download %s",
+                    temporary_path,
+                    exc_info=True,
+                )
+
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -1119,6 +1170,7 @@ bot = AntiCheatBot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     global database_pool, _persistent_view_registered
+    await asyncio.to_thread(download_production_yolo_model)
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL must be set to connect to Neon PostgreSQL.")
