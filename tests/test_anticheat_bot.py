@@ -178,6 +178,8 @@ class FakeDatabasePool:
                 offender_avg_speed=args[17],
                 offender_jitter_hz=args[18],
             )
+        if len(args) >= 20:
+            self.report["source_channel_id"] = args[19]
         self.next_report_id += 1
         return self.report["id"]
 
@@ -292,6 +294,21 @@ class DatabaseInitializationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReportEmbedTests(unittest.TestCase):
+    def test_source_link_uses_original_channel_and_does_not_guess_for_old_reports(self):
+        report = {
+            "guild_id": 73,
+            "source_channel_id": 702,
+            "source_message_id": 1003,
+            "video_url": "https://example.test/clip.mp4",
+        }
+        with patch.dict(app.KANAL_ANTYCHEAT_MAGAZYN, {73: 999}):
+            self.assertIn(
+                "https://discord.com/channels/73/702/1003",
+                app._report_embed(report).description,
+            )
+            del report["source_channel_id"]
+            self.assertNotIn("Oryginalne zgłoszenie", app._report_embed(report).description)
+
     def test_embed_handles_null_and_zero_metrics_and_bounds_long_text(self):
         report = {
             "id": 999,
@@ -418,7 +435,20 @@ class AnalyzerTests(unittest.TestCase):
             )
 
         self.assertFalse(result["alert"])
+        self.assertIn("Za mało poprawnych klatek", result["powod"])
         optical_flow.assert_not_called()
+        capture.release.assert_called_once()
+
+    def test_single_frame_does_not_produce_clean_report(self):
+        frame = np.zeros((32, 32, 3), dtype=np.uint8)
+        capture = Mock()
+        capture.read.side_effect = [(True, frame), (False, None)]
+        capture.get.return_value = 30
+        capture.isOpened.return_value = True
+        with patch.object(app.cv2, "VideoCapture", return_value=capture):
+            result = app.SafeBallisticAnalyzer().procesuj_wideo_synchronicznie("one-frame.mp4")
+        self.assertIn("Za mało poprawnych klatek", result["powod"])
+        self.assertNotIn("raport", result)
         capture.release.assert_called_once()
 
     def test_opencv_decode_exception_is_reported_without_leaking_capture(self):
@@ -745,7 +775,7 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                                     *background_tasks, return_exceptions=True
                                 )
 
-                        message.delete.assert_awaited_once()
+                        message.delete.assert_not_awaited()
                         message.channel.send.assert_awaited_once()
                         self.assertIn(
                             "jest przetwarzane",
@@ -765,6 +795,10 @@ class AsyncProcessingTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("(ID: 123)", embed.description)
                         self.assertIn(
                             "[Otwórz wideo w przeglądarce](https://example.test/clips/clip%20one.mp4)",
+                            embed.description,
+                        )
+                        self.assertIn(
+                            "https://discord.com/channels/73/702/1003",
                             embed.description,
                         )
                         self.assertIn(

@@ -157,6 +157,7 @@ SCHEMA_UPGRADE_STATEMENTS = (
     "ALTER TABLE reports ADD COLUMN IF NOT EXISTS lag_detected BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE reports ADD COLUMN IF NOT EXISTS offender_avg_speed DOUBLE PRECISION",
     "ALTER TABLE reports ADD COLUMN IF NOT EXISTS offender_jitter_hz DOUBLE PRECISION",
+    "ALTER TABLE reports ADD COLUMN IF NOT EXISTS source_channel_id BIGINT",
     "CREATE UNIQUE INDEX IF NOT EXISTS player_profiles_discord_id_unique_idx "
     "ON player_profiles (discord_id) WHERE discord_id IS NOT NULL",
     "CREATE UNIQUE INDEX IF NOT EXISTS player_profiles_epic_key_unique_idx "
@@ -481,13 +482,7 @@ class SafeBallisticAnalyzer:
             if not center_speeds:
                 return {
                     "alert": False,
-                    "raport": "Brak krytycznych odchyleń.",
-                    "avg_speed": 0.0,
-                    "overall_avg_speed": 0.0,
-                    "magnitude_variance": 0.0,
-                    "jitter_frequency": 0.0,
-                    "control_type": "PAD",
-                    "multi": None,
+                    "powod": "Za mało poprawnych klatek do analizy ruchu.",
                 }
 
             avg_speed = float(np.mean(center_speeds))
@@ -1318,6 +1313,15 @@ def _report_embed(report):
         else "🟢 CZYSTO (Ruch i fizyka w normie)"
     )
     video_link = quote(video_url, safe=":/?&=%#[]!$'*+,;@")
+    guild_id = _report_value(report, "guild_id", None)
+    source_message_id = _report_value(report, "source_message_id", None)
+    archive_channel_id = _report_value(report, "source_channel_id", None)
+    source_link = ""
+    if all(str(value).isdigit() for value in (guild_id, archive_channel_id, source_message_id)):
+        source_link = (
+            f"**Oryginalne zgłoszenie:** [Otwórz w magazynie]"
+            f"(https://discord.com/channels/{guild_id}/{archive_channel_id}/{source_message_id})\n"
+        )
 
     embed = discord.Embed(
         title=(
@@ -1345,7 +1349,8 @@ def _report_embed(report):
         f"**Profil sterowania (POV):** `{control_type}`\n\n"
         f"**Metryki szczegółowe:**\n{numeric_stats}\n"
         f"**Status bota:** {status_text}\n\n"
-        f"**Dowód wideo:** [Otwórz wideo w przeglądarce]({video_link})\n\n"
+        f"**Dowód wideo:** [Otwórz wideo w przeglądarce]({video_link})\n"
+        f"{source_link}\n"
         "**Logi z analizatora wizyjnego:**\n"
         f"```text\n{raw_report}\n```\n"
         f"{footer_note}"
@@ -1657,10 +1662,11 @@ async def _process_submission(message, video_url, filename, status_message):
                             control_type, avg_speed, magnitude_variance, jitter_frequency,
                             is_anomalous, report_status, raw_report_text,
                             offender_name, anomaly_type, anomaly_second, anomaly_clock,
-                            detail_log, lag_detected, offender_avg_speed, offender_jitter_hz
+                            detail_log, lag_detected, offender_avg_speed, offender_jitter_hz,
+                            source_channel_id
                         )
                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'PENDING', $11,
-                                $12, $13, $14, $15, $16, $17, $18, $19)
+                                $12, $13, $14, $15, $16, $17, $18, $19, $20)
                         ON CONFLICT (source_message_id) DO NOTHING
                         RETURNING id
                         """,
@@ -1687,6 +1693,7 @@ async def _process_submission(message, video_url, filename, status_message):
                         bool(result.get("lag_detected", False)),
                         offender_stats["avg_speed"] if offender_stats else None,
                         offender_stats["jitter_hz"] if offender_stats else None,
+                        message.channel.id,
                     )
                     if report_id is None:
                         report_id = await connection.fetchval(
@@ -1721,23 +1728,14 @@ async def _process_submission(message, video_url, filename, status_message):
                     return
                 await _dispatch_report(report_id, alerts_channel)
 
-            status_updated = await _update_submission_status(
+            await _update_submission_status(
                 status_message,
                 message.id,
                 f"💚 Dziękujemy za zgłoszenie, {message.author.mention}! "
-                f"Plik {filename} został zapisany do weryfikacji.",
+                f"Plik {filename} został zapisany do weryfikacji. "
+                "Nie usuwaj oryginalnego zgłoszenia z kanału.",
                 delete_after=15,
             )
-            if not status_updated:
-                return
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                LOGGER.exception(
-                    "Could not remove source message %s after report %s was persisted",
-                    message.id,
-                    report_id,
-                )
     except FileTooLargeError:
         LOGGER.warning("Report processing failed: video too large (message %s)", message.id)
         await _update_submission_status(
